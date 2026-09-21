@@ -38,11 +38,12 @@ test("keyframeCodec ignores delta frames of either codec", () => {
   assert.equal(keyframeCodec(Buffer.from("not video")), null);
 });
 
-function tapInto(dir) {
+function tapInto(dir, extra = {}) {
   const converted = [];
   const tap = createLiveStillTap({
     sn: "CAM1",
     dir,
+    ...extra,
     toJpeg: async (frame, codec) => {
       converted.push({ frame, codec });
       return Buffer.from(`JPEG:${codec}`);
@@ -91,5 +92,76 @@ test("a failed conversion is reported, not thrown", async () => {
   });
   tap.onChunk(H264_KEY);
   assert.equal(await tap.flush(), false);
-  assert.match(logs[0], /could not keep the last live picture: ffmpeg exited 1/);
+  assert.match(logs[0], /could not keep the live picture: ffmpeg exited 1/);
+});
+
+test("the picture is saved DURING the stream: after firstAfterMs, then every everyMs", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-"));
+  let clock = 0;
+  const { tap, converted } = tapInto(dir, { firstAfterMs: 5_000, everyMs: 30_000, now: () => clock });
+  tap.onChunk(H264_KEY); // t=0: the first frames after a wake are often mis-exposed — not yet
+  await tap.idle();
+  assert.equal(converted.length, 0);
+  clock = 6_000;
+  tap.onChunk(H264_KEY); // past firstAfterMs → saved while the stream still runs
+  await tap.idle();
+  assert.equal(converted.length, 1);
+  assert.equal(fs.existsSync(path.join(dir, "last-live-CAM1.jpg")), true);
+  clock = 20_000;
+  tap.onChunk(H264_KEY); // only 14s since the last save → not yet
+  await tap.idle();
+  assert.equal(converted.length, 1);
+  clock = 37_000;
+  tap.onChunk(H264_KEY); // 31s since the last save → saved again
+  await tap.idle();
+  assert.equal(converted.length, 2);
+});
+
+test("flush saves a newer keyframe at the end, but not one that was already saved", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-"));
+  let clock = 0;
+  const { tap, converted } = tapInto(dir, { firstAfterMs: 5_000, everyMs: 30_000, now: () => clock });
+  tap.onChunk(H264_KEY);
+  clock = 6_000;
+  tap.onChunk(HEVC_KEY); // saved during the stream
+  await tap.idle();
+  assert.equal(converted.length, 1);
+  clock = 9_000;
+  tap.onChunk(H264_KEY); // newer, not yet saved
+  assert.equal(await tap.flush(), true);
+  assert.equal(converted.length, 2);
+  assert.equal(converted[1].codec, "h264"); // the end shows the last moment seen
+});
+
+test("flush has nothing to add when the last keyframe was already saved", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-"));
+  let clock = 0;
+  const { tap, converted } = tapInto(dir, { firstAfterMs: 0, now: () => clock });
+  tap.onChunk(H264_KEY); // firstAfterMs 0 → saved at once
+  await tap.idle();
+  assert.equal(await tap.flush(), false);
+  assert.equal(converted.length, 1);
+});
+
+test("conversions never overlap: a keyframe due while one is running is skipped, not stacked", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-"));
+  let clock = 0;
+  let release;
+  let running = 0;
+  let maxRunning = 0;
+  const tap = createLiveStillTap({
+    sn: "CAM1", dir, firstAfterMs: 0, everyMs: 0, now: () => clock,
+    toJpeg: async () => {
+      running += 1; maxRunning = Math.max(maxRunning, running);
+      await new Promise((r) => { release = r; });
+      running -= 1;
+      return Buffer.from("J");
+    },
+  });
+  tap.onChunk(H264_KEY); // starts a slow conversion
+  clock = 1;
+  tap.onChunk(H264_KEY); // due too, but one is running — skipped, not stacked
+  release();
+  await tap.idle();
+  assert.equal(maxRunning, 1);
 });

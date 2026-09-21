@@ -1,8 +1,8 @@
 // Keep a battery camera's LIVE picture as its still — taken from a stream that is already running, never by
 // waking the camera for it. With SNAPSHOT_LIVE=auto a battery camera answers /snapshot from disk, and until
 // now that meant the last event's thumbnail, which can be days old while someone watched the camera an hour
-// ago. /stream already carries every frame through the bridge, so the last keyframe of a watched stream is
-// kept and, when the stream ends, turned into last-live-<sn>.jpg; /snapshot serves whichever picture is newer.
+// ago. /stream already carries every frame through the bridge, so a watched stream's keyframes are turned
+// into last-live-<sn>.jpg as it runs and once more when it ends; /snapshot serves whichever picture is newer.
 //
 // Each chunk of an openReadable() feed is one whole access unit, and keyframes carry their own parameter
 // sets (SDK live-media docs), so a single keyframe decodes on its own — no SDK call, no extra P2P traffic.
@@ -54,29 +54,68 @@ export function accessUnitToJpeg(au, codec, { ffmpeg = "ffmpeg", timeoutMs = 10_
 }
 
 /**
- * Watch one /stream feed: remember its latest keyframe, and on flush() write it as last-live-<sn>.jpg.
- * flush() is safe to call more than once (the route's cleanup can fire from several events).
+ * Watch one /stream feed and keep its picture on disk as last-live-<sn>.jpg: first `firstAfterMs` into the
+ * stream (the very first frames after a wake are often mis-exposed while exposure and IR settle), then every
+ * `everyMs` while it runs, and once more on flush() when it ends. Saving DURING the stream matters because a
+ * consumer can hold a stream well past the viewer: HA keeps an unused HLS output open for 60s, so a still
+ * written only at the end showed up a minute late. Pacing is driven by arriving keyframes, not timers.
+ * Conversions never overlap, and flush() is safe to call more than once (the route's cleanup can fire from
+ * several events).
  */
-export function createLiveStillTap({ sn, dir, toJpeg = accessUnitToJpeg, log = () => {} }) {
-  let latest = null;
-  return {
-    onChunk(chunk) {
-      const codec = keyframeCodec(chunk);
-      if (codec) latest = { au: Buffer.from(chunk), codec }; // a copy: the feed may reuse its buffers
-    },
-    async flush() {
-      if (!latest) return false;
-      const { au, codec } = latest;
-      latest = null;
+export function createLiveStillTap({
+  sn, dir, toJpeg = accessUnitToJpeg, log = () => {}, firstAfterMs = 5_000, everyMs = 30_000, now = Date.now,
+}) {
+  let startedAt = null;
+  let lastSaveAt = null;
+  let latest = null; // { au, codec, seq }
+  let seq = 0;
+  let savedSeq = 0;
+  let busy = null;
+  let flushing = null;
+
+  const save = (frame) => {
+    busy = (async () => {
       try {
-        const jpeg = await toJpeg(au, codec);
+        const jpeg = await toJpeg(frame.au, frame.codec);
         await fs.promises.writeFile(path.join(dir, `last-live-${sn}.jpg`), jpeg);
-        log(`/stream ${sn} → kept the last live picture as the still (${jpeg.length}B, ${codec})`);
+        savedSeq = Math.max(savedSeq, frame.seq);
+        log(`/stream ${sn} → kept the live picture as the still (${jpeg.length}B, ${frame.codec})`);
         return true;
       } catch (e) {
-        log(`/stream ${sn} → could not keep the last live picture: ${e?.message ?? e}`);
+        log(`/stream ${sn} → could not keep the live picture: ${e?.message ?? e}`);
         return false;
+      } finally {
+        busy = null;
       }
+    })();
+    return busy;
+  };
+
+  return {
+    onChunk(chunk) {
+      const t = now();
+      startedAt ??= t;
+      const codec = keyframeCodec(chunk);
+      if (!codec) return;
+      latest = { au: Buffer.from(chunk), codec, seq: ++seq }; // a copy: the feed may reuse its buffers
+      const due = lastSaveAt == null ? t - startedAt >= firstAfterMs : t - lastSaveAt >= everyMs;
+      if (due && !busy && !flushing) {
+        lastSaveAt = t;
+        void save(latest);
+      }
+    },
+    /** Resolves once no conversion is running (for callers and tests that must not race a save). */
+    idle() {
+      return busy ?? Promise.resolve();
+    },
+    /** Save the newest keyframe if it has not been saved yet. Resolves true when a file was written. */
+    flush() {
+      flushing ??= (async () => {
+        if (busy) await busy;
+        if (!latest || latest.seq <= savedSeq) return false;
+        return save(latest);
+      })();
+      return flushing;
     },
   };
 }
