@@ -53,7 +53,7 @@ function setup({ live, stored, env = {}, persist = true, battery = true } = {}) 
       },
     },
   };
-  return { handler: createHttpHandler(ctx), calls };
+  return { handler: createHttpHandler(ctx), calls, dir };
 }
 
 /** Run one GET and capture status + body. */
@@ -133,4 +133,26 @@ test("snapshot: SNAPSHOT_LIVE=1 forces the burst even on a battery camera", asyn
   assert.equal(out.code, 200);
   assert.equal(out.body.toString(), "LIVE");
   assert.equal(calls.live, 1);
+});
+
+test("snapshot: serves the last live picture when it is newer than the last event", async () => {
+  const { handler, calls, dir } = setup({ live: "throw", stored: "throw", battery: true });
+  const live = path.join(dir, "last-live-CAM1.jpg");
+  fs.writeFileSync(live, Buffer.from("LIVEFRAME"));
+  const past = new Date(Date.now() - 3_600_000); // the event was an hour ago
+  fs.utimesSync(path.join(dir, "last-event-CAM1.jpg"), past, past);
+  const out = await get(handler);
+  assert.equal(out.code, 200);
+  assert.equal(out.body.toString(), "LIVEFRAME");
+  assert.equal(calls.live, 0); // still never woke the battery camera
+});
+
+test("snapshot: a newer event thumbnail wins over an older live picture", async () => {
+  const { handler, dir } = setup({ live: "throw", stored: "throw", battery: true });
+  const live = path.join(dir, "last-live-CAM1.jpg");
+  fs.writeFileSync(live, Buffer.from("LIVEFRAME"));
+  const past = new Date(Date.now() - 3_600_000); // someone watched an hour ago, the event is fresh
+  fs.utimesSync(live, past, past);
+  const out = await get(handler);
+  assert.deepEqual(out.body, JPEG);
 });

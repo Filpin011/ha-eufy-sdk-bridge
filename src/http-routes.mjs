@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { streamClientFor } from "../streams.mjs";
+import { createLiveStillTap } from "./live-still.mjs";
 
 function json(res, code, body) {
   const s = JSON.stringify(body);
@@ -92,12 +93,22 @@ export function createHttpHandler(ctx) {
     // thumbnail: without it every still is a 502 after a 10-20s wake, and the caller (HA, HomeKit) then
     // falls back to pulling video — waking the camera again for a picture we already have on disk.
     if (kind === "snapshot" && sn) {
-      const file = path.join(eventImageDir, `last-event-${sn}.jpg`);
-      /** Serve the persisted thumbnail. Instant, and it never touches the camera. */
+      // Two pictures can sit on disk: the last event's thumbnail, and the last frame of a stream someone
+      // watched (live-still.mjs). Either may be the more recent one, so serve whichever is newer.
+      const candidates = [
+        { file: path.join(eventImageDir, `last-live-${sn}.jpg`), label: "last live picture" },
+        { file: path.join(eventImageDir, `last-event-${sn}.jpg`), label: "last event thumbnail" },
+      ];
+      /** Serve the newest persisted picture. Instant, and it never touches the camera. */
       const servePersisted = async (why) => {
         try {
-          const cached = await fs.promises.readFile(file);
-          ctx.eventLog?.(`/snapshot ${sn} → 200 cached thumbnail (${cached.length}B, from disk; ${why})`);
+          const stats = await Promise.all(
+            candidates.map((c) => fs.promises.stat(c.file).then((s) => ({ ...c, at: s.mtimeMs }), () => null)),
+          );
+          const newest = stats.filter(Boolean).sort((a, b) => b.at - a.at)[0];
+          if (!newest) return false;
+          const cached = await fs.promises.readFile(newest.file);
+          ctx.eventLog?.(`/snapshot ${sn} → 200 ${newest.label} (${cached.length}B, from disk; ${why})`);
           res.writeHead(200, { "content-type": "image/jpeg", "content-length": cached.length });
           res.end(cached);
           return true;
@@ -217,8 +228,13 @@ export function createHttpHandler(ctx) {
         rtspLastActive.set(sn, Date.now()); // a live stream counts as activity for the rtspStream auto-off
         res.writeHead(200, { "content-type": "video/H264", "cache-control": "no-cache" });
         feed.pipe(res);
+        // Remember the stream's latest keyframe so the still can show what was last SEEN, not only the
+        // last event — without ever waking the camera for it (see live-still.mjs).
+        const still = createLiveStillTap({ sn, dir: eventImageDir, log: ctx.eventLog ?? (() => {}) });
+        feed.on("data", still.onChunk);
         // streaming.delete returns true only on the first cleanup for this feed → broadcast "off" once.
         const cleanup = () => {
+          void still.flush(); // no-op after the first call
           feed.destroy();
           if (streaming.delete(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: false });
           activeStreams.delete(sn);
