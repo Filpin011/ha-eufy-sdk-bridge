@@ -106,11 +106,18 @@ export function createHttpHandler(ctx) {
         }
       };
       try {
-        const cam = (await eufy.getDevice(sn)).camera?.();
+        const device = await eufy.getDevice(sn);
+        const cam = device.camera?.();
         if (!cam) return json(res, 404, { error: "no camera on this device" });
+        // A battery camera pays a radio wake for every still; a mains one does not. Same test the idle
+        // watcher uses (see stream-idle.mjs), so "which cameras are expensive" is decided in one way.
+        const onBattery = (device.describe?.()?.capabilities ?? []).includes("battery");
+        const wantLive = cfg.snapshotLive === "auto" ? !onBattery : cfg.snapshotLive;
         let jpeg;
-        let why = "live burst disabled (SNAPSHOT_LIVE=0)";
-        if (cfg.snapshotLive) {
+        let why = cfg.snapshotLive === "auto"
+          ? "battery camera — no live burst (SNAPSHOT_LIVE=auto)"
+          : "live burst disabled (SNAPSHOT_LIVE=0)";
+        if (wantLive) {
           try {
             ({ jpeg } = await cam.snapshotLive());
             why = "";

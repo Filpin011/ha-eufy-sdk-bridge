@@ -72,7 +72,12 @@ export function loadConfig(env = process.env) {
     // no thumbnail, `snapshotStored()` is always empty, so the burst is the only path and every tile costs
     // a wake (and a ~10-20s stall, past HA's 10s still timeout). Set SNAPSHOT_LIVE=0 to skip the burst and
     // answer from the retained/persisted thumbnail only. Default on — unchanged behaviour.
-    snapshotLive: env.SNAPSHOT_LIVE == null ? true : truthy(env.SNAPSHOT_LIVE),
+    // "auto" (default): wake the camera for a still only when it is MAINS-POWERED. A mains camera
+    // answers a live burst for free; a battery one pays a radio wake for every fetch, and a host fetches
+    // stills on a timer (HA re-pulls each camera tile), so the cost is continuous. `1` forces the burst
+    // everywhere, `0` never — both remain available for hosts that want the old behaviour.
+    snapshotLive:
+      env.SNAPSHOT_LIVE == null || env.SNAPSHOT_LIVE === "auto" ? "auto" : truthy(env.SNAPSHOT_LIVE),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's
