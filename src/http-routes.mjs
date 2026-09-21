@@ -87,21 +87,57 @@ export function createHttpHandler(ctx) {
     }
     if (!flags.ready) return json(res, 503, { error: "not authenticated", auth: ctx.authStatus() });
 
-    // A current still: a fresh live burst, falling back to the retained push thumbnail.
+    // A current still: a fresh live burst, falling back to the retained push thumbnail, and finally to
+    // the copy /event-image persisted on disk. That last step matters on accounts whose pushes carry no
+    // thumbnail: without it every still is a 502 after a 10-20s wake, and the caller (HA, HomeKit) then
+    // falls back to pulling video — waking the camera again for a picture we already have on disk.
     if (kind === "snapshot" && sn) {
+      const file = path.join(eventImageDir, `last-event-${sn}.jpg`);
+      /** Serve the persisted thumbnail. Instant, and it never touches the camera. */
+      const servePersisted = async (why) => {
+        try {
+          const cached = await fs.promises.readFile(file);
+          ctx.eventLog?.(`/snapshot ${sn} → 200 cached thumbnail (${cached.length}B, from disk; ${why})`);
+          res.writeHead(200, { "content-type": "image/jpeg", "content-length": cached.length });
+          res.end(cached);
+          return true;
+        } catch {
+          return false;
+        }
+      };
       try {
         const cam = (await eufy.getDevice(sn)).camera?.();
         if (!cam) return json(res, 404, { error: "no camera on this device" });
         let jpeg;
-        try {
-          ({ jpeg } = await cam.snapshotLive());
-        } catch {
-          jpeg = await cam.snapshotStored?.(); // may throw when nothing is retained
+        let why = "live burst disabled (SNAPSHOT_LIVE=0)";
+        if (cfg.snapshotLive) {
+          try {
+            ({ jpeg } = await cam.snapshotLive());
+            why = "";
+          } catch (e) {
+            why = `live burst failed: ${e?.message ?? e}`;
+          }
+        } else if (await servePersisted(why)) {
+          // No live burst wanted, and the disk copy holds the same picture the retained thumbnail would:
+          // answer from it straight away rather than paying a round-trip per fetch — on an account that
+          // retains nothing that call costs ~0.85s and never succeeds, and HA re-fetches stills on a timer.
+          return;
         }
-        if (!jpeg) return json(res, 404, { error: "no image available" });
-        res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length });
-        return res.end(jpeg);
+        if (!jpeg) {
+          try {
+            jpeg = await cam.snapshotStored?.(); // may throw when nothing is retained
+          } catch (e) {
+            why = `${why}; nothing retained: ${e?.reason ?? e?.message ?? e}`;
+          }
+        }
+        if (jpeg) {
+          res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length });
+          return res.end(jpeg);
+        }
+        if (await servePersisted(why || "no image from the camera")) return;
+        return json(res, 404, { error: "no image available", reason: why });
       } catch (e) {
+        if (await servePersisted(`snapshot failed: ${e?.message ?? e}`)) return;
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

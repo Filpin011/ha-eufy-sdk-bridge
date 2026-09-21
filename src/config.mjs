@@ -67,6 +67,12 @@ export function loadConfig(env = process.env) {
     // hammering consumer gets a fast 503 instead of a radio wake. Cleared on a successful open or a
     // detection. Default 30s (≈ one ffmpeg retry cycle); 0 disables.
     streamFailBackoffMs: env.STREAM_FAIL_BACKOFF_MS != null ? Number(env.STREAM_FAIL_BACKOFF_MS) : 30_000,
+    // A live snapshot burst wakes a battery camera's radio for EVERY caller — and HA fetches a still per
+    // camera whenever a dashboard renders or the HomeKit tiles refresh. On an account whose pushes carry
+    // no thumbnail, `snapshotStored()` is always empty, so the burst is the only path and every tile costs
+    // a wake (and a ~10-20s stall, past HA's 10s still timeout). Set SNAPSHOT_LIVE=0 to skip the burst and
+    // answer from the retained/persisted thumbnail only. Default on — unchanged behaviour.
+    snapshotLive: env.SNAPSHOT_LIVE == null ? true : truthy(env.SNAPSHOT_LIVE),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's
