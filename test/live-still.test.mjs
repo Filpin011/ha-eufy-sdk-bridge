@@ -87,8 +87,12 @@ test("a failed conversion is reported, not thrown", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-"));
   const logs = [];
   const tap = createLiveStillTap({
-    sn: "CAM1", dir, log: (m) => logs.push(m),
-    toJpeg: async () => { throw new Error("ffmpeg exited 1"); },
+    sn: "CAM1",
+    dir,
+    log: (m) => logs.push(m),
+    toJpeg: async () => {
+      throw new Error("ffmpeg exited 1");
+    },
   });
   tap.onChunk(H264_KEY);
   assert.equal(await tap.flush(), false);
@@ -150,10 +154,17 @@ test("conversions never overlap: a keyframe due while one is running is skipped,
   let running = 0;
   let maxRunning = 0;
   const tap = createLiveStillTap({
-    sn: "CAM1", dir, firstAfterMs: 0, everyMs: 0, now: () => clock,
+    sn: "CAM1",
+    dir,
+    firstAfterMs: 0,
+    everyMs: 0,
+    now: () => clock,
     toJpeg: async () => {
-      running += 1; maxRunning = Math.max(maxRunning, running);
-      await new Promise((r) => { release = r; });
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      await new Promise((r) => {
+        release = r;
+      });
       running -= 1;
       return Buffer.from("J");
     },

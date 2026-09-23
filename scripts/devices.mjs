@@ -23,7 +23,10 @@ ws.on("message", (data) => {
     pending.delete(m.id);
   }
 });
-ws.on("error", (e) => { console.error("WS error:", e.message); process.exit(1); });
+ws.on("error", (e) => {
+  console.error("WS error:", e.message);
+  process.exit(1);
+});
 
 ws.on("open", async () => {
   const { auth } = await rpc("auth.status");
@@ -32,11 +35,17 @@ ws.on("open", async () => {
     process.exit(2);
   }
   const { ok, devices, error } = await rpc("devices.list");
-  if (!ok) { console.error("devices.list failed:", error); process.exit(1); }
+  if (!ok) {
+    console.error("devices.list failed:", error);
+    process.exit(1);
+  }
 
   console.log(`\n${devices.length} device(s):\n`);
   for (const d of devices) {
-    if (d.error) { console.log(`  ✗ ${d.sn}: ${d.error}`); continue; }
+    if (d.error) {
+      console.log(`  ✗ ${d.sn}: ${d.error}`);
+      continue;
+    }
     const stream = d.stream ? `  stream=${d.stream}` : "";
     console.log(`  • ${d.name}  [${d.codec}]  ${d.sn}${stream}`);
     console.log(`      caps: ${(d.capabilities || []).join(", ")}`);

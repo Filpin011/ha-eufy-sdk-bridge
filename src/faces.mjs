@@ -5,9 +5,7 @@
 
 /** Parse `person_basic_info` rows out of a reassembled P2P DB reply (name precedes person_id). */
 export function parseFaceRoster(text) {
-  const rows = text.matchAll(
-    /\{"age":\d+,[^{}]*?"name":"([^"]*)"[^{}]*?"person_id":(\d+),"relation":"([^"]*)"/g,
-  );
+  const rows = text.matchAll(/\{"age":\d+,[^{}]*?"name":"([^"]*)"[^{}]*?"person_id":(\d+),"relation":"([^"]*)"/g);
   const out = new Map();
   for (const m of rows) {
     const id = Number(m[2]);

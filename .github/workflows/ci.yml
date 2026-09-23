@@ -1,0 +1,34 @@
+# PR gate for the bridge: every pull request into main or dev must lint, compile and test clean.
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      # npm check: install exactly what the lockfile pins (fails if package.json/lock drift, or a dep
+      # can't be resolved from the registry). The SDK is a public npm package, so no auth is needed.
+      - name: Install (npm ci)
+        run: npm ci
+      # lint: formatting is enforced, not debated.
+      - name: Lint (Prettier)
+        run: npm run lint
+      # compile: the bridge is ESM (no tsc), so syntax-check every module — catches parse/typo errors
+      # a plain `require` at runtime would only hit lazily.
+      - name: Compile (ESM syntax-check)
+        run: |
+          set -e
+          for f in $(git ls-files '*.mjs'); do node --check "$f"; done
+      - name: Test
+        run: npm test

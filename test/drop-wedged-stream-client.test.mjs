@@ -43,10 +43,22 @@ function setup() {
 async function pull(handler) {
   const out = { chunks: [] };
   const res = {
-    writeHead(code) { out.code = code; },
-    write(c) { out.chunks.push(Buffer.from(c)); return true; },
-    end(body) { if (body) out.chunks.push(Buffer.from(body)); },
-    on() {}, once() {}, emit() {}, removeListener() {}, off() {}, destroy() {},
+    writeHead(code) {
+      out.code = code;
+    },
+    write(c) {
+      out.chunks.push(Buffer.from(c));
+      return true;
+    },
+    end(body) {
+      if (body) out.chunks.push(Buffer.from(body));
+    },
+    on() {},
+    once() {},
+    emit() {},
+    removeListener() {},
+    off() {},
+    destroy() {},
   };
   await handler({ url: "/stream/CAM1", headers: { host: "localhost" }, on() {} }, res);
   return out;
