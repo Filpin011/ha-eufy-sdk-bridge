@@ -51,6 +51,22 @@ export async function streamClientFor(sn, cfg) {
   return client;
 }
 
+/**
+ * Forget a camera's stream client after a failed open, so the next attempt builds a fresh session.
+ *
+ * The cache is keyed per camera and never expires: a client whose P2P session dies stays cached, and
+ * every later open reuses it and fails again — surfacing as "P2P unreachable" long after the camera is
+ * reachable. Observed over a whole evening: the eufy app held a live view of the same camera while every
+ * bridge attempt failed, and only a bridge restart (which empties this map) recovered it.
+ */
+export function dropStreamClient(sn) {
+  const client = clients.get(sn);
+  if (!client) return false;
+  clients.delete(sn);
+  void client.disconnect?.().catch(() => {}); // best-effort; the next open builds a new one regardless
+  return true;
+}
+
 /** Tear down every stream client (on shutdown). */
 export async function closeStreamClients() {
   await Promise.all([...clients.values()].map((c) => c.disconnect?.().catch(() => {})));

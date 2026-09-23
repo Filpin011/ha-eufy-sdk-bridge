@@ -4,7 +4,7 @@
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
 import path from "node:path";
-import { streamClientFor } from "../streams.mjs";
+import { streamClientFor, dropStreamClient } from "../streams.mjs";
 import { createLiveStillTap } from "./live-still.mjs";
 
 function json(res, code, body) {
@@ -26,6 +26,7 @@ export function createHttpHandler(ctx) {
   // Per-camera P2P client for /stream. Production uses the module cache in streams.mjs; ctx may
   // supply its own so the route can be driven without a login (tests).
   const openStreamClient = ctx.streamClientFor ?? streamClientFor;
+  const dropClient = ctx.dropStreamClient ?? dropStreamClient;
   const { flags } = ctx.state;
   const { streaming, idleSuspended, activeStreams, lastPullAttempt, rtspLastActive } = ctx.state;
 
@@ -251,6 +252,7 @@ export function createHttpHandler(ctx) {
         return;
       } catch (e) {
         ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
+        dropClient(sn); // never reuse a session that just failed — see dropStreamClient in streams.mjs
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }
