@@ -9,12 +9,12 @@ export function createState() {
   return {
     // Mutable scalar flags — grouped so cross-module writes stay legible.
     flags: {
-      ready: false,        // logged in + booted
-      sessionLost: false,  // cloud token kicked/expired AFTER boot → re-auth needed (ready stays true so
-                           // completeBoot's one-time wiring is not re-run; authStatus reflects the loss)
+      ready: false, // logged in + booted
+      sessionLost: false, // cloud token kicked/expired AFTER boot → re-auth needed (ready stays true so
+      // completeBoot's one-time wiring is not re-run; authStatus reflects the loss)
       lastLogin: undefined, // the most recent LoginResult (undefined until the first attempt)
       booting: false,
-      recovering: false,   // a re-auth / stall recovery is in flight — blocks the watchdog racing it
+      recovering: false, // a re-auth / stall recovery is in flight — blocks the watchdog racing it
       lastActivity: Date.now(), // ms of the last poll heartbeat / realtime event (liveness clock)
       pushConnected: false,
       pushSince: Date.now(),
@@ -23,26 +23,26 @@ export function createState() {
     // Interval handles, armed once at boot and cleared on shutdown.
     timers: { watchdog: null, streamIdle: null, rtspIdle: null },
 
-    clients: new Set(),   // connected WS clients (broadcast targets)
+    clients: new Set(), // connected WS clients (broadcast targets)
     streaming: new Set(), // sns with a live P2P feed piping right now
 
     // person_id -> { name, familiar } — the HomeBase edge-AI face roster, built once at startup.
     faceNames: new Map(),
 
     // ── live-stream idle auto-off bookkeeping ──
-    lastDetect: new Map(),      // sn -> ms of the most recent detection
-    activeStreams: new Map(),   // sn -> { feed, startedAt } for feeds currently piping
-    idleSuspended: new Set(),   // sns torn down for idleness; reopen blocked until motion or consumer-gone
+    lastDetect: new Map(), // sn -> ms of the most recent detection
+    activeStreams: new Map(), // sn -> { feed, startedAt } for feeds currently piping
+    idleSuspended: new Set(), // sns torn down for idleness; reopen blocked until motion or consumer-gone
     lastPullAttempt: new Map(), // sn -> ms go2rtc last asked for /stream (even while suspended)
-    rtspLastActive: new Map(),  // sn -> ms of last detection/stream, for the battery rtspStream auto-off
-    streamBackoff: new Map(),   // sn -> { until, streak } — fast-503 after a failed open so a hammering consumer can't wake the radio every retry
+    rtspLastActive: new Map(), // sn -> ms of last detection/stream, for the battery rtspStream auto-off
+    streamBackoff: new Map(), // sn -> { until, streak } — fast-503 after a failed open so a hammering consumer can't wake the radio every retry
 
     // ── optional Anker Solix (separate account/backend; only populated when SOLIX_* is configured) ──
     solix: {
       status: "disabled", // disabled | connecting | 2fa | ready | error
-      devices: new Map(),  // sn -> SolixDevice
-      client: undefined,   // SolixClient
-      mqtt: undefined,     // SolixMqtt telemetry stream
+      devices: new Map(), // sn -> SolixDevice
+      client: undefined, // SolixClient
+      mqtt: undefined, // SolixMqtt telemetry stream
     },
   };
 }

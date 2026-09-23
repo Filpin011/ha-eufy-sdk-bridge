@@ -33,15 +33,38 @@ export function keyframeCodec(au) {
 /** Decode one keyframe access unit to a JPEG with the ffmpeg the image already ships (for go2rtc). */
 export function accessUnitToJpeg(au, codec, { ffmpeg = "ffmpeg", timeoutMs = 10_000 } = {}) {
   return new Promise((resolve, reject) => {
-    const args = ["-hide_banner", "-loglevel", "error", "-f", codec, "-i", "pipe:0",
-      "-frames:v", "1", "-pix_fmt", "yuvj420p", "-q:v", "3", "-f", "image2", "-c:v", "mjpeg", "pipe:1"];
+    const args = [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      codec,
+      "-i",
+      "pipe:0",
+      "-frames:v",
+      "1",
+      "-pix_fmt",
+      "yuvj420p",
+      "-q:v",
+      "3",
+      "-f",
+      "image2",
+      "-c:v",
+      "mjpeg",
+      "pipe:1",
+    ];
     const proc = spawn(ffmpeg, args, { stdio: ["pipe", "pipe", "pipe"] });
     const out = [];
     let err = "";
     const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
     proc.stdout.on("data", (c) => out.push(c));
-    proc.stderr.on("data", (c) => { err += c; });
-    proc.on("error", (e) => { clearTimeout(timer); reject(e); });
+    proc.stderr.on("data", (c) => {
+      err += c;
+    });
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
     proc.on("close", (code) => {
       clearTimeout(timer);
       const jpeg = Buffer.concat(out);
@@ -63,7 +86,13 @@ export function accessUnitToJpeg(au, codec, { ffmpeg = "ffmpeg", timeoutMs = 10_
  * several events).
  */
 export function createLiveStillTap({
-  sn, dir, toJpeg = accessUnitToJpeg, log = () => {}, firstAfterMs = 5_000, everyMs = 30_000, now = Date.now,
+  sn,
+  dir,
+  toJpeg = accessUnitToJpeg,
+  log = () => {},
+  firstAfterMs = 5_000,
+  everyMs = 30_000,
+  now = Date.now,
 }) {
   let startedAt = null;
   let lastSaveAt = null;

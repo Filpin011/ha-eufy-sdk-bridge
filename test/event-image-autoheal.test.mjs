@@ -62,3 +62,37 @@ test("autoHealEventImage ignores a missing serial", async () => {
   await tick();
   assert.equal(runs(), 0);
 });
+
+/** A warmup whose SDK lists the given sessions and records whether the device list was read. */
+function withSessions(entries) {
+  let listed = false;
+  const warm = createWarmup({
+    eventImageDir: os.tmpdir(),
+    eventLog: () => {},
+    broadcast: () => {},
+    state: { faceNames: new Map() },
+    eufy: {
+      getP2pSessions: () => new Map(entries),
+      getDevices: async () => {
+        listed = true;
+        return [];
+      },
+    },
+  });
+  return { warm, listed: () => listed };
+}
+
+test("refreshLastEventImageFor skips a camera's media session (only stations hold the DB)", async () => {
+  const { warm, listed } = withSessions([["T8030P0000000000#live:1", { isConnected: true }]]);
+  assert.equal(await warm.refreshLastEventImageFor("SN1"), false);
+  assert.equal(listed(), false); // bailed before any query: no station session to run one on
+});
+
+test("refreshLastEventImageFor still considers a station's own session", async () => {
+  const { warm, listed } = withSessions([
+    ["T8030P0000000000", { isConnected: false }],
+    ["T8030P0000000000#live:1", { isConnected: true }],
+  ]);
+  assert.equal(await warm.refreshLastEventImageFor("SN1"), false);
+  assert.equal(listed(), true); // the station session kept the refresh going
+});

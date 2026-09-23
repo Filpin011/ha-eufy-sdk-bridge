@@ -31,7 +31,9 @@ async function logCameraChannelMap(eufy, cams) {
     });
   if (!rows.length) return;
   console.log("[bridge] camera channel map (station  raw=device_channel → resolvedChannel  sn  model):");
-  for (const r of [...rows].sort((a, b) => a.station.localeCompare(b.station) || String(a.raw).localeCompare(String(b.raw))))
+  for (const r of [...rows].sort(
+    (a, b) => a.station.localeCompare(b.station) || String(a.raw).localeCompare(String(b.raw)),
+  ))
     console.log(`  ${r.station}  raw=${r.raw} → ch=${r.channel}  ${r.sn}  ${r.model}  p2p=${r.p2p}`);
   // Flag same-station cameras sharing a raw device_channel (both-missing counts) — the collision signature.
   const byStationChannel = new Map();
@@ -60,8 +62,13 @@ export function createBoot(ctx) {
     if (flags.go2rtcProc) return;
     try {
       flags.go2rtcProc = spawn("go2rtc", ["-config", cfg.go2rtcConfig], { stdio: "inherit" });
-      flags.go2rtcProc.on("error", (e) => console.error(`[bridge] go2rtc not started (${e.message}) — WS/control still up`));
-      flags.go2rtcProc.on("exit", (code) => { console.error(`[bridge] go2rtc exited (${code})`); flags.go2rtcProc = undefined; });
+      flags.go2rtcProc.on("error", (e) =>
+        console.error(`[bridge] go2rtc not started (${e.message}) — WS/control still up`),
+      );
+      flags.go2rtcProc.on("exit", (code) => {
+        console.error(`[bridge] go2rtc exited (${code})`);
+        flags.go2rtcProc = undefined;
+      });
     } catch (e) {
       console.error(`[bridge] go2rtc spawn failed: ${e?.message ?? e}`);
     }

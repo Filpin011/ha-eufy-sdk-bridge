@@ -2,18 +2,14 @@
 #
 # Trigger: a published GitHub Release (the release tag names the version), or a manual run.
 # Output:  ghcr.io/mega-yfue/ha-eufy-sdk-bridge:<version> + :latest — one manifest carrying
-#          linux/amd64, linux/arm64 and linux/arm/v7 (the arches the add-on builds FROM).
+#          linux/amd64 + linux/arm64 (node:24-alpine has no arm/v7 base).
 #
-# This is the CI counterpart of scripts/publish-multiarch.sh; the Dockerfile already selects the
-# go2rtc binary by TARGETARCH, so no per-arch handling lives here.
-#
-# ── Required secret ───────────────────────────────────────────────────────────────────────────────
-# The bridge depends on the PRIVATE @mega-yfue/eufy-sdk (file:../eufy-sdk), supplied to the build as
-# the `sdk` named context — so CI must check that repo out. `GITHUB_TOKEN` cannot read another private
-# repo, so add a repo secret:
-#   SDK_REPO_TOKEN = a fine-grained PAT with `Contents: read` on mega-yfue/eufy-sdk
-#                    (or a classic PAT with `repo` scope).
-# Pushing to ghcr.io/mega-yfue/* uses the built-in GITHUB_TOKEN via `packages: write` below.
+# The SDK is a PUBLIC npm package (pulled by `npm ci` in the build), so no SDK checkout / build context.
+# Uses the docker CLI in shell rather than the docker/* marketplace actions, because the org's Actions
+# policy allows only actions owned by mega-yfue or created by GitHub — so `actions/checkout` is fine,
+# but `docker/build-push-action` etc. are not. buildx is preinstalled on the runner; arm64 emulation
+# comes from a `tonistiigi/binfmt` image pull (an image, not an action). Push uses the built-in
+# GITHUB_TOKEN via `packages: write`.
 name: Publish image to GHCR
 
 on:
@@ -22,12 +18,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag (e.g. 0.1.36). Defaults to package.json."
+        description: "Image version tag (e.g. 0.2.0). Defaults to package.json."
         required: false
-      sdk_ref:
-        description: "eufy-sdk ref to build against."
-        required: false
-        default: beta-0.1.0
 
 permissions:
   contents: read
@@ -40,16 +32,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the bridge
-        uses: actions/checkout@v4
-
-      - name: Check out eufy-sdk (private — supplies the build's `sdk` context)
-        uses: actions/checkout@v4
-        with:
-          repository: mega-yfue/eufy-sdk
-          ref: ${{ github.event.inputs.sdk_ref || 'beta-0.1.0' }}
-          token: ${{ secrets.SDK_REPO_TOKEN }}
-          path: eufy-sdk
+      - uses: actions/checkout@v4
 
       - name: Resolve version (release tag must match package.json)
         id: v
@@ -61,7 +44,7 @@ jobs:
           else
             VER="$(node -p "require('./package.json').version")"
           fi
-          VER="${VER#v}"   # tolerate a leading v (v0.1.36 → 0.1.36)
+          VER="${VER#v}"   # tolerate a leading v (v0.2.0 → 0.2.0)
           PKG="$(node -p "require('./package.json').version")"
           if [ "$VER" != "$PKG" ]; then
             echo "::error::release/input version '$VER' does not match package.json '$PKG' — bump package.json to match before releasing"
@@ -70,40 +53,28 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "Publishing $IMAGE:$VER (+ :latest)"
 
-      - name: Set up QEMU (arm emulation for the arm64/arm-v7 legs)
-        uses: docker/setup-qemu-action@v3
+      - name: Enable arm64 emulation (binfmt)
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm64
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Create a buildx builder
+        run: docker buildx create --use --name eufy-ci --driver docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build and push the multi-arch manifest
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          build-contexts: |
-            sdk=./eufy-sdk
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
-            ${{ env.IMAGE }}:latest
-          # Speeds up re-runs; the arm legs build under emulation and are the slow part.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "$IMAGE:${{ steps.v.outputs.version }}" \
+            --tag "$IMAGE:latest" \
+            --push \
+            .
 
       - name: Summary
         run: |
           {
             echo "### Published \`$IMAGE:${{ steps.v.outputs.version }}\`"
             echo ""
-            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`, \`linux/arm/v7\` · also tagged \`:latest\`"
-            echo ""
-            echo "Verify: \`docker buildx imagetools inspect $IMAGE:${{ steps.v.outputs.version }}\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\` · also tagged \`:latest\`"
           } >> "$GITHUB_STEP_SUMMARY"

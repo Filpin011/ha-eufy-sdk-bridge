@@ -44,7 +44,9 @@ export function createStreamIdle(ctx) {
     const streak = (streamBackoff.get(sn)?.streak ?? 0) + 1;
     const window = Math.min(cfg.streamFailBackoffMs * 2 ** (streak - 1), STREAM_FAIL_BACKOFF_MAX_MS);
     streamBackoff.set(sn, { until: Date.now() + window, streak });
-    console.log(`[bridge] stream(${sn}) open failed (#${streak}) — backing off reopen ${Math.round(window / 1000)}s (P2P unreachable)`);
+    console.log(
+      `[bridge] stream(${sn}) open failed (#${streak}) — backing off reopen ${Math.round(window / 1000)}s (P2P unreachable)`,
+    );
   }
 
   /** A stream opened successfully → the camera is reachable, clear any failure backoff. */
@@ -60,16 +62,28 @@ export function createStreamIdle(ctx) {
     if (!cfg.rtspIdleOffMs || !flags.ready || flags.recovering) return;
     const now = Date.now();
     let devices;
-    try { devices = await ctx.deviceList(); } catch { return; }
+    try {
+      devices = await ctx.deviceList();
+    } catch {
+      return;
+    }
     for (const d of devices) {
       const sn = d.sn;
       if (!(d.capabilities ?? []).includes("battery")) continue; // battery cameras only
-      if (d.state?.rtspStream !== true) continue;                 // only if currently publishing
-      if (activeStreams.has(sn)) { rtspLastActive.set(sn, now); continue; } // being streamed = active
+      if (d.state?.rtspStream !== true) continue; // only if currently publishing
+      if (activeStreams.has(sn)) {
+        rtspLastActive.set(sn, now);
+        continue;
+      } // being streamed = active
       const lastSeen = rtspLastActive.get(sn);
-      if (lastSeen === undefined) { rtspLastActive.set(sn, now); continue; } // give a full window from first sight
+      if (lastSeen === undefined) {
+        rtspLastActive.set(sn, now);
+        continue;
+      } // give a full window from first sight
       if (now - lastSeen < cfg.rtspIdleOffMs) continue;
-      console.log(`[bridge] ${sn} battery + rtspStream idle ${Math.round((now - lastSeen) / 1000)}s — turning rtspStream OFF (battery-save)`);
+      console.log(
+        `[bridge] ${sn} battery + rtspStream idle ${Math.round((now - lastSeen) / 1000)}s — turning rtspStream OFF (battery-save)`,
+      );
       try {
         await eufy.setProperty(sn, "rtspStream", false);
         rtspLastActive.set(sn, now); // reset so we don't re-fire before the state refreshes

@@ -35,7 +35,9 @@ test("enrichPersonName: resolves a known person, leaves others", () => {
   const { enrichPersonName } = createFaces(ctx);
 
   assert.deepEqual(enrichPersonName("personDetected", { person_id: 5 }), {
-    person_id: 5, person_name: "Alice", recognized: true,
+    person_id: 5,
+    person_name: "Alice",
+    recognized: true,
   });
   // unknown positive id ⇒ recognized:false, no name
   assert.deepEqual(enrichPersonName("personDetected", { person_id: 99 }), { person_id: 99, recognized: false });

@@ -48,7 +48,10 @@ function setup({ live, stored, env = {}, persist = true, battery = true } = {}) 
         return {
           camera: () => cam,
           // A battery camera pays a radio wake per still; a mains one does not. The route reads this.
-          describe: () => ({ sn: "CAM1", capabilities: battery ? ["camera", "video", "battery"] : ["camera", "video"] }),
+          describe: () => ({
+            sn: "CAM1",
+            capabilities: battery ? ["camera", "video", "battery"] : ["camera", "video"],
+          }),
         };
       },
     },
@@ -60,8 +63,13 @@ function setup({ live, stored, env = {}, persist = true, battery = true } = {}) 
 async function get(handler, url = "/snapshot/CAM1") {
   const out = {};
   const res = {
-    writeHead(code, headers) { out.code = code; out.headers = headers; },
-    end(body) { out.body = body; },
+    writeHead(code, headers) {
+      out.code = code;
+      out.headers = headers;
+    },
+    end(body) {
+      out.body = body;
+    },
   };
   await handler({ url, headers: { host: "localhost" }, on() {} }, res);
   return out;

@@ -18,9 +18,7 @@ const REFRESH_DELAY_MS = Number(process.env.EVENT_IMAGE_REFRESH_DELAY_MS) || 300
 // single early query gets the previous cover ("unchanged") or a crop-less record, so "Last event"
 // advances its date but shows the previous image. So the local-cover refresh RETRIES on an escalating
 // schedule until a genuinely-new image lands (then nudges HA once and stops). ~60s of coverage total.
-const LOCAL_REFRESH_SCHEDULE = (
-  process.env.EVENT_IMAGE_REFRESH_SCHEDULE_MS || "3000,4000,6000,10000,15000,20000"
-)
+const LOCAL_REFRESH_SCHEDULE = (process.env.EVENT_IMAGE_REFRESH_SCHEDULE_MS || "3000,4000,6000,10000,15000,20000")
   .split(",")
   .map((n) => Number(n.trim()))
   .filter((n) => Number.isFinite(n) && n > 0);
@@ -60,12 +58,22 @@ export function createWarmup(ctx) {
     return devs.find((d) => d.raw?.member?.admin_user_id)?.raw?.member?.admin_user_id ?? eufy.api?.auth?.userId ?? "";
   }
 
+  /**
+   * The stations' own P2P sessions, which are what the DB queries here run on. `getP2pSessions()` also
+   * lists per-camera MEDIA sessions (keyed `<stationSn>#live:<channel>`), opened for a camera whose
+   * station session is already streaming; those carry live media only, so a DB query on one would be
+   * wasted at best and disturb that camera's stream at worst.
+   */
+  function stationSessions() {
+    return new Map([...eufy.getP2pSessions()].filter(([key]) => !String(key).includes("#live:")));
+  }
+
   /** Sessions come up asynchronously after login — wait (up to ~20s) for at least one to appear. */
   async function awaitSessions() {
-    let sessions = eufy.getP2pSessions();
+    let sessions = stationSessions();
     for (let i = 0; i < 20 && sessions.size === 0; i++) {
       await sleep(1000);
-      sessions = eufy.getP2pSessions();
+      sessions = stationSessions();
     }
     return sessions;
   }
@@ -298,7 +306,7 @@ export function createWarmup(ctx) {
     return withDbLock(async () => {
       if (!sn) return false;
       try {
-        const sessions = eufy.getP2pSessions();
+        const sessions = stationSessions();
         if (!sessions.size) return false;
         const devs = await eufy.getDevices();
         const accountId = await accountIdOf(devs);

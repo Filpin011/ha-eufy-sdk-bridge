@@ -43,10 +43,19 @@ function setup(env = {}) {
 async function pull(handler) {
   const out = {};
   const res = {
-    writeHead(code) { out.code = code; },
-    write() { return true; },
+    writeHead(code) {
+      out.code = code;
+    },
+    write() {
+      return true;
+    },
     end() {},
-    on() {}, once() {}, emit() {}, removeListener() {}, off() {}, destroy() {},
+    on() {},
+    once() {},
+    emit() {},
+    removeListener() {},
+    off() {},
+    destroy() {},
   };
   await handler({ url: "/stream/CAM1", headers: { host: "localhost" }, on() {} }, res);
   return out;

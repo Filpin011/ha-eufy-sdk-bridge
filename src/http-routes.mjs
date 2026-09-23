@@ -42,7 +42,9 @@ export function createHttpHandler(ctx) {
       const data = await r.json();
       const consumers = (data?.consumers ?? data?.[sn]?.consumers ?? []).filter(Boolean);
       if (!consumers.length) {
-        ctx.eventLog?.(`/stream ${sn} — go2rtc reports NO consumers (a leftover ffmpeg retry / probe, not a live viewer)`);
+        ctx.eventLog?.(
+          `/stream ${sn} — go2rtc reports NO consumers (a leftover ffmpeg retry / probe, not a live viewer)`,
+        );
         return;
       }
       for (const c of consumers) {
@@ -83,7 +85,7 @@ export function createHttpHandler(ctx) {
         sessionLost: flags.sessionLost, // cloud token kicked/expired since boot → re-auth in progress/needed
         streaming: [...streaming],
         idleSuspended: [...idleSuspended], // cameras auto-off for no recent detection (awaiting next one)
-        streamIdleMs: cfg.streamIdleMs,    // 0 = idle auto-off disabled
+        streamIdleMs: cfg.streamIdleMs, // 0 = idle auto-off disabled
         lastActivitySec: idleSec, // seconds since the last poll heartbeat / realtime event
         stalled: flags.ready && idleSec * 1000 >= ctx.stallThresholdMs(),
         pushConnected: flags.pushConnected, // FCM push channel — events (motion/doorbell/…) ride this
@@ -107,7 +109,12 @@ export function createHttpHandler(ctx) {
       const servePersisted = async (why) => {
         try {
           const stats = await Promise.all(
-            candidates.map((c) => fs.promises.stat(c.file).then((s) => ({ ...c, at: s.mtimeMs }), () => null)),
+            candidates.map((c) =>
+              fs.promises.stat(c.file).then(
+                (s) => ({ ...c, at: s.mtimeMs }),
+                () => null,
+              ),
+            ),
           );
           const newest = stats.filter(Boolean).sort((a, b) => b.at - a.at)[0];
           if (!newest) return false;
@@ -129,9 +136,10 @@ export function createHttpHandler(ctx) {
         const onBattery = (device.describe?.()?.capabilities ?? []).includes("battery");
         const wantLive = cfg.snapshotLive === "auto" ? !onBattery : cfg.snapshotLive;
         let jpeg;
-        let why = cfg.snapshotLive === "auto"
-          ? "battery camera — no live burst (SNAPSHOT_LIVE=auto)"
-          : "live burst disabled (SNAPSHOT_LIVE=0)";
+        let why =
+          cfg.snapshotLive === "auto"
+            ? "battery camera — no live burst (SNAPSHOT_LIVE=auto)"
+            : "live burst disabled (SNAPSHOT_LIVE=0)";
         if (wantLive) {
           try {
             ({ jpeg } = await cam.snapshotLive());
@@ -202,7 +210,9 @@ export function createHttpHandler(ctx) {
         } catch {
           // No live and no persisted image. Surface the SDK reason (not-observed / pending /
           // download-failed / invalid-image) so a caller can tell "no event yet" from a failure.
-          ctx.eventLog(`/event-image ${sn} → 404 no image (reason=${e?.reason ?? e?.message ?? e}) — Last event NOT updated`);
+          ctx.eventLog(
+            `/event-image ${sn} → 404 no image (reason=${e?.reason ?? e?.message ?? e}) — Last event NOT updated`,
+          );
           return json(res, 404, { error: String(e?.message ?? e), reason: e?.reason });
         }
       }
@@ -214,12 +224,16 @@ export function createHttpHandler(ctx) {
       // Idle-suspended: no detection recently, so don't reopen the P2P session. go2rtc's ffmpeg source
       // retries into this until a detection or the consumer giving up lifts it (see streamIdleTick).
       if (cfg.streamIdleMs && idleSuspended.has(sn))
-        return json(res, 503, { error: "stream idle-suspended — no recent detection, waiting for motion or a fresh viewer" });
+        return json(res, 503, {
+          error: "stream idle-suspended — no recent detection, waiting for motion or a fresh viewer",
+        });
       // Failure-backoff: a recent open failed (P2P unreachable), and go2rtc retries every ~30s. Serve a
       // fast 503 without opening a P2P session, so a camera that can't connect isn't woken on every retry.
       const backoff = ctx.streamBackoffMs?.(sn) ?? 0;
       if (backoff > 0)
-        return json(res, 503, { error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)` });
+        return json(res, 503, {
+          error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)`,
+        });
       try {
         const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
         const cam = (await client.getDevice(sn)).camera?.();
