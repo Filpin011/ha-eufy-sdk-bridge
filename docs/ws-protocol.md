@@ -167,6 +167,29 @@ device's capabilities expose (e.g. `statusLed`, `nightVision`, guard-mode `mode`
 { "id": 6, "ok": false, "error": "device … does not support 'statusLed'" }
 ```
 
+### `device.action`
+Invoke a capability **action** — a typed method that is not a scalar property, so `device.set` cannot
+reach it. `{ sn, action, args? }`, where `args` is the positional argument list. Only methods a
+capability surface exposes are reachable; today those surfaces are `smart_light`, `camera`, `lock` and
+`siren`. *(Requires auth.)*
+
+```jsonc
+// sound the alarm for 10 s — a HomeBase, or a camera attached to one
+{ "id": 9, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "trigger", "args": [10] }
+// ←
+{ "id": 9, "ok": true, "result": null }
+// stop it before the duration runs out
+{ "id": 10, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "stop" }
+// no surface on this device carries the verb →
+{ "id": 11, "ok": false, "error": "no action 'trigger' on EXAMPLE-CAM-0002" }
+```
+
+The siren verbs install only where the SDK has evidence for a wire: a HomeBase reporting hub-alarm
+params, a camera attached to one that reports the EAS slot, or a standalone siren (`stop` only, plus
+its own `test`). A device that has them lists `"siren"` among its `devices.list` capabilities — the
+duration is validated by the SDK, which rejects anything that is not a positive whole number of
+seconds.
+
 ### `device.reboot`
 Reboot a **HomeBase / station** (maps to the SDK's `reboot`). Only devices with `canReboot: true` accept
 it; the SDK throws for a non-hub serial. The hub drops offline for a minute or two, then rejoins.
@@ -340,8 +363,7 @@ raw video protocol.
 ---
 
 ## Not yet exposed
-- Capability **action** verbs (PTZ move, siren test, talkback) — only property writes via `device.set`
-  today.
+- Capability **action** verbs beyond the surfaces `device.action` routes today (PTZ move, talkback).
 - Guard / station security mode (arm home/away/disarm).
 - Per-device event subscription/filtering (events broadcast to all clients).
 - Audio / recording / timelapse.

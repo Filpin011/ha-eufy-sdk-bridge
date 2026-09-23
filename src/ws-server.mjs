@@ -140,7 +140,8 @@ export function createWsServer(ctx, httpServer) {
           const surfaces = [
             dev.smartLight?.(),
             dev.camera?.(),
-            dev.lock?.()
+            dev.lock?.(),
+            dev.siren?.()
           ].filter(Boolean);
           const surface = surfaces.find((s) => typeof s?.[action] === "function");
           if (!surface) return fail(`no action '${action}' on ${msg.sn}`);
