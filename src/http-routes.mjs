@@ -23,6 +23,9 @@ const STREAM_CONSUMER_LOG_MS = Number(process.env.BRIDGE_STREAM_CONSUMER_LOG_MS 
 
 export function createHttpHandler(ctx) {
   const { cfg, eufy, SCHEMA_VERSION, eventImageDir } = ctx;
+  // Per-camera P2P client for /stream. Production uses the module cache in streams.mjs; ctx may
+  // supply its own so the route can be driven without a login (tests).
+  const openStreamClient = ctx.streamClientFor ?? streamClientFor;
   const { flags } = ctx.state;
   const { streaming, idleSuspended, activeStreams, lastPullAttempt, rtspLastActive } = ctx.state;
 
@@ -217,10 +220,13 @@ export function createHttpHandler(ctx) {
       if (backoff > 0)
         return json(res, 503, { error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)` });
       try {
-        const client = await streamClientFor(sn, cfg); // its OWN P2P session — see streams.mjs
+        const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) return json(res, 404, { error: "no live video on this device" });
-        const feed = await cam.openReadable(); // node Readable of Annex-B
+        // The battery budget only takes effect when this call opens the session, which it does: the stream
+        // client is dedicated to /stream (stills go through the control client), so nothing opens it first.
+        const budget = cfg.streamBatteryBudgetMs;
+        const feed = await cam.openReadable(budget ? { batteryBudgetMs: budget } : undefined); // Annex-B
         ctx.noteStreamOpened?.(sn); // reachable again → clear any failure backoff
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });
         streaming.add(sn);

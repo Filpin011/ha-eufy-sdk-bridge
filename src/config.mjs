@@ -5,6 +5,11 @@ import path from "node:path";
 export const SCHEMA_VERSION = 1; // bump on any breaking protocol change so an old frontend fails loudly
 
 const truthy = (v) => /^(1|true|yes|on)$/i.test(String(v ?? ""));
+/** A positive whole number from an env value, else undefined (so the caller's default applies). */
+const positiveInt = (v) => {
+  const n = Number(v);
+  return v != null && v !== "" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
+};
 
 /** The SDK event names broadcast to every connected WS client. */
 export const FORWARDED_EVENTS = [
@@ -78,6 +83,13 @@ export function loadConfig(env = process.env) {
     // everywhere, `0` never — both remain available for hosts that want the old behaviour.
     snapshotLive:
       env.SNAPSHOT_LIVE == null || env.SNAPSHOT_LIVE === "auto" ? "auto" : truthy(env.SNAPSHOT_LIVE),
+    // How long a BATTERY camera may stream continuously, handed to the SDK when /stream opens the session.
+    // The SDK bounds a battery stream to a budget (default 45s) plus a 10s grace, then stops it unless the
+    // caller extends it — and a Readable, which is what /stream consumes, has no way to extend. So every
+    // watched battery stream ended after ~55s, and the consumer's reconnect woke the camera again. Unset
+    // keeps the SDK default. Mains cameras ignore it, and closing the last viewer still ends the session
+    // at once. Positive whole ms; anything else → default.
+    streamBatteryBudgetMs: positiveInt(env.STREAM_BATTERY_BUDGET_MS),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's
