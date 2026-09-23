@@ -5,6 +5,51 @@
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
+/**
+ * One-shot boot diagnostic: print each camera's station + P2P channel so a same-model collision is
+ * visible in the log. Two cameras on ONE HomeBase that share a raw `device_channel` (or both omit it) is
+ * the signature of the bug where only one of a same-model pair streams and updates detections — the SDK
+ * addresses live video + inbound frames by (station, channel), so a shared channel collapses both onto
+ * the first. `resolvedChannel` is the SDK's own disambiguated `EufyDevice.channel` (present once the
+ * channel-disambiguation build is installed); when it differs from `raw` per camera, the fix is active.
+ * Best-effort; never throws.
+ */
+async function logCameraChannelMap(eufy, cams) {
+  const camSns = new Set(cams.map((c) => c.sn));
+  const rows = (await eufy.getDevices())
+    .filter((d) => camSns.has(d.sn))
+    .map((d) => {
+      const raw = d.raw?.device_channel;
+      return {
+        sn: d.sn,
+        model: d.raw?.device_model ?? "?",
+        station: d.stationSn ?? d.sn,
+        raw: typeof raw === "number" ? raw : "∅",
+        channel: typeof d.channel === "number" ? d.channel : "—",
+        p2p: d.p2pDid ? "yes" : "no",
+      };
+    });
+  if (!rows.length) return;
+  console.log("[bridge] camera channel map (station  raw=device_channel → resolvedChannel  sn  model):");
+  for (const r of [...rows].sort((a, b) => a.station.localeCompare(b.station) || String(a.raw).localeCompare(String(b.raw))))
+    console.log(`  ${r.station}  raw=${r.raw} → ch=${r.channel}  ${r.sn}  ${r.model}  p2p=${r.p2p}`);
+  // Flag same-station cameras sharing a raw device_channel (both-missing counts) — the collision signature.
+  const byStationChannel = new Map();
+  for (const r of rows) {
+    const key = `${r.station}|${r.raw}`;
+    let list = byStationChannel.get(key);
+    if (!list) byStationChannel.set(key, (list = []));
+    list.push(r.sn);
+  }
+  for (const [key, sns] of byStationChannel) {
+    if (sns.length < 2) continue;
+    const [station, raw] = key.split("|");
+    console.log(
+      `  ⚠ CHANNEL COLLISION on ${station} raw device_channel=${raw}: ${sns.join(", ")} — only one streams/detects until the SDK channel-disambiguation fix is deployed`,
+    );
+  }
+}
+
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
   const { flags, timers } = ctx.state;
@@ -67,6 +112,7 @@ export function createBoot(ctx) {
       if (cfg.streamIdleMs) timers.streamIdle ??= setInterval(() => ctx.streamIdleTick(), 30_000);
       if (cfg.rtspIdleOffMs) timers.rtspIdle ??= setInterval(() => void ctx.rtspIdleSweep(), 60_000);
       console.log(`[bridge] ready — ${summaries.length} devices, ${cams.length} camera stream(s)`);
+      await logCameraChannelMap(eufy, cams).catch(() => {});
       ctx.broadcast({ event: "ready", schemaVersion: SCHEMA_VERSION });
       // Both read the P2P DB via a shared `dbChunk` stream — run sequentially so their accumulators don't
       // cross-contaminate. Non-blocking so `ready` isn't held up.
