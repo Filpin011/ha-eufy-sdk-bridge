@@ -28,7 +28,12 @@ export async function writeGo2rtcConfig(cfg, devices) {
   ];
   for (const d of cams) {
     // A stream id per camera serial; the source is this bridge's own HTTP feed.
-    lines.push(`  ${d.sn}: ffmpeg:http://${cfg.selfHost}:${cfg.port}/stream/${d.sn}#video=copy`);
+    // `#async` makes ffmpeg stamp frames from the wall clock (-use_wallclock_as_timestamps 1 -async 1)
+    // instead of trusting the camera's. The eufy feed starts at dts 0 and then jumps, which a consumer
+    // reads as a broken stream: Home Assistant aborts with "Timestamp discontinuity detected: last dts =
+    // 0, dts = 4219155056" seconds after the picture starts flowing. Re-stamping costs nothing here —
+    // the feed is remuxed, not transcoded, and a live view has no timeline to preserve.
+    lines.push(`  ${d.sn}: ffmpeg:http://${cfg.selfHost}:${cfg.port}/stream/${d.sn}#video=copy#async`);
   }
   const yaml = lines.join("\n") + "\n";
   await mkdir(dirname(cfg.go2rtcConfig), { recursive: true }).catch(() => {});
