@@ -3,7 +3,14 @@
 // needs other modules (error → session recovery, push liveness) lives in server.mjs, after ctx is whole.
 import { EufyMega, FileSessionStore, FileFcmStore, ConsoleLogger } from "@mega-yfue/eufy-sdk";
 
-/** Build the SDK client from config. `logger` is attached only under BRIDGE_DEBUG_P2P (raw transport logs). */
+/**
+ * Build the SDK client from config. `logger` is attached only under BRIDGE_DEBUG_P2P (raw transport logs).
+ *
+ * The logger is constructed WITHOUT a level so `ConsoleLogger`'s own `"debug"` default applies. The
+ * transport lines this flag exists for are emitted at `debug`, and `LEVEL_RANK` puts `debug` below
+ * `info`, so passing `"info"` here silenced exactly what the flag is meant to turn on: with it set you
+ * got `p2pConnect` and nothing else, never the `[p2p] <sn> <<< …` frames.
+ */
 export function createEufy({ cfg, DEBUG_P2P }) {
   return new EufyMega({
     email: cfg.email,
@@ -21,6 +28,6 @@ export function createEufy({ cfg, DEBUG_P2P }) {
     // radio isn't held open ~28s per doorbell/person/pet/package event. BRIDGE_PREWARM=1 → undefined,
     // which lets the SDK use its default high-intent pre-warm events.
     prewarmEvents: cfg.prewarm ? undefined : [],
-    logger: DEBUG_P2P ? new ConsoleLogger("info") : undefined,
+    logger: DEBUG_P2P ? new ConsoleLogger() : undefined,
   });
 }
