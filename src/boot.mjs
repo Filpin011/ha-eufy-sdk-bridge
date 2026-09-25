@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.7";
+const PROBE_BUILD = "probe.8";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -52,15 +52,27 @@ export function createBoot(ctx) {
   }
   setTimeout(() => void kickoff("20s after boot"), 20000);
   setTimeout(() => void kickoff("retry at 90s"), 90000);
+  /**
+   * Ask the camera for files on its own SD card, in the order that makes the answer readable.
+   *
+   * First a JPEG we know is there — the snapshot written beside the clip. That is the CONTROL: if the
+   * proven file-read primitive cannot fetch even that, the mechanism does not work on a standalone
+   * camera, and the video is not the reason. Only then the clip itself, then the catalogued download
+   * and record-list commands.
+   *
+   * The earlier attempt had the envelope wrong: the first argument of sendStringPayloadCommand is the
+   * WRAPPER (CMD_SET_PAYLOAD 1350); the command being asked for goes inside it as `cmd`.
+   */
   async function trySdRead(sn) {
     if (sdTried) return;
     const sessions = eufy.getP2pSessions?.() ?? new Map();
     const entry = sn ? [[sn, sessions.get(sn)]] : [...sessions];
     const [stationSn, session] = entry.find(([, s2]) => s2?.isConnected) ?? [];
-    if (!session) return console.log("[probe] no connected P2P session yet — open the live view");
+    if (!session) return console.log("[probe] no connected P2P session yet");
     sdTried = true;
 
-    const clipPath = process.env.PROBE_CLIP || lastClip?.path || FALLBACK_CLIP;
+    const clip = process.env.PROBE_CLIP || lastClip?.path || FALLBACK_CLIP;
+    const snapshot = clip.replace(/.zxvideo$/, "_snapshot.jpg");
     let accountId = lastClip?.accountId;
     if (!accountId) {
       try {
@@ -73,37 +85,52 @@ export function createBoot(ctx) {
 
     let frames = 0;
     const onData = (frame) => {
-      if (frames++ > 60) return;
+      if (frames++ > 120) return;
       const head = frame?.data?.subarray?.(0, 16)?.toString("hex") ?? "";
       const js = frame?.json ? JSON.stringify(frame.json).slice(0, 300) : "";
       console.log(
         `[probe] frame ${frame?.commandName} bytes=${frame?.data?.length ?? 0} head=${head}${js ? " json=" + js : ""}`,
       );
     };
+    const onImage = ({ file, data }) => console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
     session.on("data", onData);
-    console.log(`[probe] station=${stationSn} account=${accountId ?? "?"} asking for ${clipPath}`);
+    session.on("image", onImage);
+    console.log(`[probe] station=${stationSn} account=${accountId ?? "?"}`);
 
-    try {
-      session.requestImage(clipPath, { accountId });
-    } catch (e) {
-      console.log(`[probe] requestImage threw: ${e?.message}`);
-    }
-    setTimeout(() => {
+    const wrapped = (cmd, payload) => JSON.stringify({ cmd, payload });
+    const steps = [
+      ["A: requestImage on a JPEG that exists (CONTROL)", () => session.requestImage(snapshot, { accountId })],
+      ["B: requestImage on the clip", () => session.requestImage(clip, { accountId })],
+      [
+        "C: CMD_DOWNLOAD_VIDEO (1024) inside CMD_SET_PAYLOAD",
+        () =>
+          session.sendStringPayloadCommand(
+            1350,
+            wrapped(1024, { file: clip, account_id: accountId, cipher_id: 0 }),
+          ),
+      ],
+      [
+        "D: CMD_RECORDLIST_SEARCH (1042) — what does the card hold",
+        () =>
+          session.sendStringPayloadCommand(
+            1350,
+            wrapped(1042, { account_id: accountId, start_date: "20260925", channel: 0 }),
+          ),
+      ],
+      ["E: CMD_SDINFO (1102)", () => session.sendStringPayloadCommand(1350, wrapped(1102, { account_id: accountId }))],
+    ];
+    for (const [label, run] of steps) {
+      console.log(`[probe] -- ${label}`);
       try {
-        const body = JSON.stringify({
-          commandType: 1024,
-          data: { filepath: clipPath, account_id: accountId, cipher_id: 0, type: 0 },
-        });
-        console.log("[probe] trying CMD_DOWNLOAD_VIDEO (1024)");
-        session.sendStringPayloadCommand(1024, body);
+        run();
       } catch (e) {
-        console.log(`[probe] 1024 threw: ${e?.message}`);
+        console.log(`[probe]    threw: ${e?.message}`);
       }
-    }, 6000);
-    setTimeout(() => {
-      session.off?.("data", onData);
-      console.log(`[probe] done — ${frames} frame(s) seen`);
-    }, 25000);
+      await new Promise((r) => setTimeout(r, 9000));
+    }
+    session.off?.("data", onData);
+    session.off?.("image", onImage);
+    console.log(`[probe] done — ${frames} frame(s) seen`);
   }
 
   function probePush(name, payload) {
