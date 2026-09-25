@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.18";
+const PROBE_BUILD = "probe.19";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -164,12 +164,35 @@ export function createBoot(ctx) {
     session.on("image", onImage);
     console.log(`[probe] station=${stationSn} account=${accountId ?? "?"}`);
 
+    // Reading a file rides the level-2 wire and nothing else. The negotiation is one-shot per
+    // connection, and once it settles without a key the session stays open while refusing every
+    // such request in silence — which is what the last attempt looked like: a session, and no
+    // frames at all. So wait for the key, ask again if it never came, and say which happened.
+    let l2ok = await session.awaitLevel2Key?.(20000, "session");
+    if (!l2ok && session.repromptLevel2Key?.()) {
+      console.log("[probe] level-2 never settled — asked again");
+      l2ok = await session.awaitLevel2Key?.(20000, "call");
+    }
+    console.log(`[probe] level-2 key: ${l2ok ? "ready" : "UNAVAILABLE — file reads will be refused"}`);
+    if (!l2ok) {
+      sdTried = false; // a fresh session negotiates normally; this one never will
+      try {
+        session.close?.();
+      } catch {
+        /* closing a dead session is not interesting */
+      }
+      return;
+    }
+
     const wrapped = (cmd, payload) => JSON.stringify({ cmd, payload });
     const steps = [
       ["A: requestImage on a JPEG that exists (CONTROL)", () => session.requestImage(snapshot, { accountId })],
       ["B: requestImage on the clip", () => session.requestImage(clip, { accountId })],
+      ["B2: the clip again", () => session.requestImage(clip, { accountId })],
+      ["B3: the clip once more", () => session.requestImage(clip, { accountId })],
     ];
     for (const [label, run] of steps) {
+      if (clipSeen) break;
       console.log(`[probe] -- ${label}`);
       try {
         run();
