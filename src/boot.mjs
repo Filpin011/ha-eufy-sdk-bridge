@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.16";
+const PROBE_BUILD = "probe.17";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -109,88 +109,80 @@ export function createBoot(ctx) {
       clipSeen = true;
       clipDone = true;
 
-      // The container is understood: XZYH, two constant bytes, a 4-byte payload length at offset 6,
-      // a keyframe flag at 13, then a 22-byte inner header. Entropy of the payload measured 7.968
-      // against 7.982 for random bytes, so it is encrypted — and getCiphers hands over key material
-      // for cipher 95. What is left is which transform turns one into the other.
       const HDR = 16;
       const recs = [];
       for (let i = 0; i + HDR <= data.length; ) {
         if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
         const len = data.readUInt32LE(i + 6);
-        recs.push({ off: i, len, keyframe: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
+        recs.push({ off: i, len, key: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
         i += HDR + len;
       }
-      console.log(`[probe] parsed ${recs.length} records cleanly (last ends @${recs.at(-1)?.off + HDR + recs.at(-1)?.len} of ${data.length})`);
+      console.log(`[probe] ${recs.length} records, last ends @${(recs.at(-1)?.off ?? 0) + HDR + (recs.at(-1)?.len ?? 0)}/${data.length}`);
       if (!recs.length) return;
+
+      // The inner header is 22 bytes — the 3-byte value at its start is always len-22. Sixteen of
+      // those twenty-two would be exactly an IV, which is worth seeing rather than assuming.
+      for (const r of recs.slice(0, 5)) {
+        console.log(`[probe]  inner @${String(r.off).padStart(7)} ${r.body.subarray(0, 32).toString("hex")}`);
+      }
+
+      // The session negotiated a 32-byte level-2 key from CMD_GATEWAYINFO, via ECIES with the same
+      // ecc_private_key getCiphers hands out. If the card reuses it, this is the whole answer.
+      const l2 = session.level2Key;
+      console.log(`[probe] level2Key: ${l2 ? `${l2.length} bytes` : "not negotiated"}`);
 
       let cipher;
       try {
-        const got = await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn);
-        cipher = got?.[0];
-      } catch (e) {
-        return console.log(`[probe] getCiphers failed: ${e?.message ?? e}`);
+        cipher = (await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn))?.[0];
+      } catch {
+        /* keep going with what we have */
       }
-      if (!cipher) return console.log("[probe] no cipher material");
-      const shapeOf = (v) =>
-        typeof v !== "string"
-          ? typeof v
-          : `${v.length}ch ${/^[0-9a-f]+$/i.test(v) ? "hex" : /^[A-Za-z0-9+/=]+$/.test(v) ? "base64?" : "other"}`;
-      console.log(`[probe] private_key: ${shapeOf(cipher.private_key)}  ecc: ${shapeOf(cipher.ecc_private_key)}`);
 
-      // Candidate keys, from the plausible readings of that material.
-      const bufs = (v) => {
-        const out = [];
-        if (typeof v !== "string") return out;
-        out.push(Buffer.from(v, "utf8"));
-        if (/^[0-9a-f]+$/i.test(v) && v.length % 2 === 0) out.push(Buffer.from(v, "hex"));
-        try {
-          out.push(Buffer.from(v, "base64"));
-        } catch {
-          /* not base64 */
-        }
-        return out;
-      };
       const keys = [];
-      for (const [name, v] of [["private_key", cipher.private_key], ["ecc", cipher.ecc_private_key]]) {
-        bufs(v).forEach((b, i) => {
-          if (b.length >= 16) keys.push([`${name}#${i}[0:16]`, b.subarray(0, 16)]);
-          keys.push([`${name}#${i}.md5`, crypto.createHash("md5").update(b).digest()]);
-        });
+      if (l2?.length === 32) {
+        keys.push(["level2[32]", Buffer.from(l2)]);
+        keys.push(["level2[0:16]", Buffer.from(l2).subarray(0, 16)]);
+        keys.push(["level2[16:32]", Buffer.from(l2).subarray(16, 32)]);
       }
-      // The serial is the other thing both ends always know.
-      const sn = lastClip?.stationSn ?? "";
-      keys.push(["sn.md5", crypto.createHash("md5").update(sn).digest()]);
-      keys.push(["sn[0:16]", Buffer.concat([Buffer.from(sn, "utf8"), Buffer.alloc(16)]).subarray(0, 16)]);
+      if (cipher?.ecc_private_key && /^[0-9a-f]{64}$/i.test(cipher.ecc_private_key)) {
+        const ecc = Buffer.from(cipher.ecc_private_key, "hex");
+        keys.push(["ecc[32]", ecc], ["ecc[0:16]", ecc.subarray(0, 16)]);
+        keys.push(["ecc.sha256", crypto.createHash("sha256").update(ecc).digest()]);
+      }
+      if (!keys.length) return console.log("[probe] no key material to try");
 
-      // Scoring: a correct decryption of a keyframe payload shows Annex-B start codes; a wrong one
-      // stays noise. Counting them is a sharper test than eyeballing bytes.
-      const score = (buf) => {
+      const score = (b) => {
         let n = 0;
-        for (let i = 0; i + 3 < buf.length; i++) {
-          if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) n++;
-        }
+        for (let i = 0; i + 3 < b.length; i++) if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) n++;
         return n;
       };
-      const body = recs[0].body.subarray(0, 8192 - (8192 % 16));
+      const body = recs[0].body;
       const zero = Buffer.alloc(16);
-      const results = [];
-      for (const [kname, key] of keys) {
-        for (const mode of ["aes-128-cbc", "aes-128-ecb", "aes-128-ctr"]) {
-          try {
-            const d = crypto.createDecipheriv(mode, key, mode === "aes-128-ecb" ? null : zero);
-            d.setAutoPadding(false);
-            const out = Buffer.concat([d.update(body), d.final()]);
-            results.push([score(out), `${kname} ${mode}`, out.subarray(0, 12).toString("hex")]);
-          } catch (e) {
-            results.push([-1, `${kname} ${mode}`, `err ${e?.message?.slice(0, 30)}`]);
+      const out = [];
+      // Two readings of where the ciphertext starts, and two of what the IV is.
+      for (const [cname, start] of [["body+0", 0], ["body+22", 22]]) {
+        const ct0 = body.subarray(start, start + 8192);
+        const ct = ct0.subarray(0, ct0.length - (ct0.length % 16));
+        for (const [iname, iv] of [["iv=0", zero], ["iv=inner[0:16]", body.subarray(0, 16)]]) {
+          for (const [kname, key] of keys) {
+            const modes = key.length === 32 ? ["aes-256-cbc", "aes-256-ecb", "aes-256-ctr"] : ["aes-128-cbc", "aes-128-ecb", "aes-128-ctr"];
+            for (const mode of modes) {
+              try {
+                const d = crypto.createDecipheriv(mode, key, mode.endsWith("ecb") ? null : iv);
+                d.setAutoPadding(false);
+                const plain = Buffer.concat([d.update(ct), d.final()]);
+                out.push([score(plain), `${kname} ${mode} ${cname} ${iname}`, plain.subarray(0, 10).toString("hex")]);
+              } catch {
+                /* unusable combination */
+              }
+            }
           }
         }
       }
-      results.sort((a, b) => b[0] - a[0]);
-      console.log(`[probe] baseline (undecrypted) score: ${score(body)}`);
-      for (const [n, what, head] of results.slice(0, 8)) {
-        console.log(`[probe]   ${String(n).padStart(4)}  ${what.padEnd(28)} ${head}`);
+      out.sort((a, b) => b[0] - a[0]);
+      console.log(`[probe] baseline: ${score(body.subarray(0, 8192))}   tried ${out.length} combinations`);
+      for (const [n, what, head] of out.slice(0, 6)) {
+        console.log(`[probe]   ${String(n).padStart(4)}  ${what.padEnd(44)} ${head}`);
       }
     };
     session.on("data", onData);
