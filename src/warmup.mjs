@@ -88,6 +88,24 @@ export function createWarmup(ctx) {
     alarm_id: "",
   };
 
+  // TEMPORARY (debug branch): print one history record verbatim, so we can see whether a row names
+  // the VIDEO file or only the cover image. Once per process, on the first query that returns rows.
+  let probed = false;
+  function probeRecords(records) {
+    if (probed) return;
+    probed = true;
+    const newest = records
+      .slice()
+      .sort((a, b) => Number(b?.start_time ?? 0) - Number(a?.start_time ?? 0))[0];
+    const keys = new Set();
+    for (const rec of records) {
+      for (const k of Object.keys(rec?.payload ?? rec ?? {})) keys.add(k);
+    }
+    console.log(`[probe] ${records.length} record(s)`);
+    console.log(`[probe] fields: ${[...keys].sort().join(", ")}`);
+    console.log(`[probe] newest: ${JSON.stringify(newest)}`);
+  }
+
   /**
    * The on-HomeBase per-event crop path for a `history_record_info` record.
    *
@@ -163,6 +181,7 @@ export function createWarmup(ctx) {
     session.off?.("dbChunk", onChunk);
 
     const records = parsed?.data ?? firstJsonObject(chunk)?.data ?? [];
+    if (records.length) probeRecords(records);
     if (!records.length) {
       // Diagnostic: distinguish "response never arrived" (chunk empty) from "arrived but unparseable /
       // no data" (chunk large) so a recurring failure points straight at transport vs shape.
