@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.19";
+const PROBE_BUILD = "probe.20";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -109,8 +109,6 @@ export function createBoot(ctx) {
       clipSeen = true;
       clipDone = true;
 
-      // Outer header 16 bytes; inner header 22, and now readable: length at 0, keyframe flag at 4,
-      // frame number at 6, 1280x720 at 10 and 12, a timestamp at 14. Payload starts at body+22.
       const HDR = 16;
       const INNER = 22;
       const recs = [];
@@ -118,47 +116,54 @@ export function createBoot(ctx) {
         if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
         const len = data.readUInt32LE(i + 6);
         const body = data.subarray(i + HDR, i + HDR + len);
-        recs.push({ off: i, len, key: data[i + 13] === 1, no: body[6], payload: body.subarray(INNER) });
+        recs.push({ off: i, len, key: data[i + 13] === 1, no: body[6], p: body.subarray(INNER) });
         i += HDR + len;
       }
-      if (!recs.length) return console.log("[probe] no records");
+      const opaqueKeys = recs.filter((r) => r.key && !(r.p[0] === 0 && r.p[1] === 0 && r.p[2] === 0 && r.p[3] === 1));
+      console.log(`[probe] ${recs.length} records, ${opaqueKeys.length} encrypted keyframes`);
+      if (opaqueKeys.length < 2) return console.log("[probe] need two keyframes to compare");
 
-      // A P-frame record opened with 00 00 00 01 41 — in the clear. Does that hold for all of them,
-      // and is the keyframe the only thing encrypted?
-      const isAnnexB = (p) => p.length > 4 && p[0] === 0 && p[1] === 0 && p[2] === 0 && p[3] === 1;
-      const plain = recs.filter((r) => isAnnexB(r.payload));
-      const keyed = recs.filter((r) => r.key);
-      const plainKeyed = keyed.filter((r) => isAnnexB(r.payload));
-      console.log(
-        `[probe] ${recs.length} records: ${plain.length} start with a start code, ${recs.length - plain.length} do not`,
-      );
-      console.log(`[probe] keyframes: ${keyed.length}, of which in the clear: ${plainKeyed.length}`);
-      const nalOf = (p) => (isAnnexB(p) ? `nal ${p[4] & 0x1f} (ref ${(p[4] >> 5) & 3})` : "opaque");
-      for (const r of recs.slice(0, 3)) console.log(`[probe]   #${r.no} key=${r.key} ${nalOf(r.payload)} ${r.payload.subarray(0, 12).toString("hex")}`);
-      for (const r of recs.filter((x) => !isAnnexB(x.payload)).slice(0, 3)) {
-        console.log(`[probe]   OPAQUE #${r.no} key=${r.key} len=${r.payload.length} ${r.payload.subarray(0, 12).toString("hex")}`);
+      const [a, b] = opaqueKeys;
+      const n = Math.min(a.p.length, b.p.length);
+
+      // Two keyframes encrypt to the same opening bytes, so there is no per-record IV. How far the
+      // agreement runs is how much plaintext they share — an SPS and a PPS, presumably.
+      let same = 0;
+      while (same < n && a.p[same] === b.p[same]) same++;
+      console.log(`[probe] two keyframes agree for ${same} bytes, then diverge`);
+
+      // The discriminator. Under a stream cipher with a fixed keystream, C1^C2 = P1^P2 — two H.264
+      // keyframes xored, which keeps structure and measures well below 8 bits. Under a block cipher
+      // it is noise. This is the difference between a problem we can solve and one we cannot.
+      const x = Buffer.alloc(Math.min(n, 65536));
+      for (let i = 0; i < x.length; i++) x[i] = a.p[i] ^ b.p[i];
+      const H = (buf) => {
+        const f = new Array(256).fill(0);
+        for (const v of buf) f[v]++;
+        let h = 0;
+        for (const c of f) if (c) h -= (c / buf.length) * Math.log2(c / buf.length);
+        return h.toFixed(3);
+      };
+      console.log(`[probe] entropy: C1=${H(a.p.subarray(0, 65536))} C1^C2=${H(x)} (ciphertext ~7.98, xor of two frames should fall well below)`);
+      console.log(`[probe] C1^C2 zero bytes: ${x.filter((v) => v === 0).length}/${x.length}`);
+
+      // A repeating keystream would show itself as periodicity: bytes matching their own echo one
+      // period away, far more often than the 1-in-256 chance.
+      const best = [];
+      for (const period of [16, 32, 64, 128, 256, 512, 1024]) {
+        let hits = 0;
+        const upto = Math.min(a.p.length - period, 40000);
+        for (let i = 0; i < upto; i++) if (a.p[i] === a.p[i + period]) hits++;
+        best.push(`${period}:${((hits / upto) * 100).toFixed(2)}%`);
       }
+      console.log(`[probe] self-match by period (chance is 0.39%): ${best.join(" ")}`);
 
-      // Which NAL types does the clear part carry? An SPS among them would mean the decoder has
-      // everything it needs except the encrypted frames.
-      const types = new Map();
-      for (const r of plain) types.set(r.payload[4] & 0x1f, (types.get(r.payload[4] & 0x1f) ?? 0) + 1);
-      console.log(`[probe] clear NAL types: ${[...types].map(([t, c]) => `${t}x${c}`).join(" ")}`);
-
-      // Write what is readable and let ffmpeg judge it. Even a partial decode proves the framing is
-      // right, and its complaint names precisely what is missing.
-      const name = file.split("/").pop().replace(/\.zxvideo$/, "");
-      try {
-        await fsp.writeFile(`/data/${name}.clear.h264`, Buffer.concat(plain.map((r) => r.payload)));
-      } catch (e) {
-        return console.log(`[probe] write failed: ${e?.message}`);
-      }
-      const tail = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
-      execFile(
-        "ffprobe",
-        ["-v", "error", "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "default=nw=1", `/data/${name}.clear.h264`],
-        (e, out, err) => console.log(`[probe] ffprobe(clear): ${e ? "REFUSED " + tail(err) : String(out).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`),
-      );
+      // If it is a keystream, this is its opening — a keyframe must begin 00 00 00 01 67.
+      const crib = Buffer.from([0x00, 0x00, 0x00, 0x01, 0x67]);
+      const ks = Buffer.alloc(crib.length);
+      for (let i = 0; i < crib.length; i++) ks[i] = a.p[i] ^ crib[i];
+      console.log(`[probe] keystream candidate (C ^ expected SPS): ${ks.toString("hex")}`);
+      console.log(`[probe] keyframe head: ${a.p.subarray(0, 32).toString("hex")}`);
     };
     session.on("data", onData);
     session.on("image", onImage);
