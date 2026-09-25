@@ -6,7 +6,7 @@ import { spawn, execFile } from "node:child_process";
 import fsp from "node:fs/promises";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.12";
+const PROBE_BUILD = "probe.13";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -104,51 +104,81 @@ export function createBoot(ctx) {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
       if (!data?.length || !file.endsWith(".zxvideo")) return;
 
-      // Read what we hold before touching the filesystem: what is inside the container and where it
-      // can be written are separate questions, and the first must not wait on the second.
-      let first = -1;
-      let starts = 0;
-      let key = 0;
+      // A census of the elementary stream, over BOTH start-code forms — a three-byte one is easy to
+      // miss, and ffmpeg's "dimensions not set" says it found no SPS, which is exactly the NAL a
+      // scan for four-byte codes alone could have walked past.
+      const hist = new Map();
+      let firstSps = -1;
+      let firstAny = -1;
       for (let i = 0; i + 4 < data.length; i++) {
-        if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-          if (first < 0) first = i;
-          starts++;
-          const t = data[i + 4] & 0x1f;
-          if (t === 7 || t === 5) key++;
-        }
+        let n = 0;
+        if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) n = 4;
+        else if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) n = 3;
+        if (!n) continue;
+        const t = data[i + n] & 0x1f;
+        hist.set(t, (hist.get(t) ?? 0) + 1);
+        if (firstAny < 0) firstAny = i;
+        if (t === 7 && firstSps < 0) firstSps = i;
+        i += n;
       }
-      console.log(`[probe] annex-b start codes: ${starts} (SPS/IDR: ${key}), first at byte ${first}`);
-      console.log(`[probe] header: ${data.subarray(0, 96).toString("hex")}`);
-      if (first < 0) return console.log("[probe] no H.264 in the clear — encrypted after all");
+      const NAME = { 1: "P/B slice", 5: "IDR", 6: "SEI", 7: "SPS", 8: "PPS", 9: "AUD" };
+      const census = [...hist]
+        .sort((a, b) => b[1] - a[1])
+        .map(([t, c]) => `${t}=${NAME[t] ?? "?"}x${c}`)
+        .join("  ");
+      console.log(`[probe] NAL census: ${census || "(nothing)"}`);
+      console.log(`[probe] first start code @${firstAny}, first SPS @${firstSps}`);
+      console.log(`[probe] head 128B: ${data.subarray(0, 128).toString("hex")}`);
 
-      const name = file.split("/").pop().replace(/.zxvideo$/, "");
-      let dir;
-      for (const cand of ["/share/eufy-probe", "/data"]) {
-        try {
-          await fsp.mkdir(cand, { recursive: true });
-          await fsp.writeFile(`${cand}/${name}.zxvideo`, data);
-          dir = cand;
-          break;
-        } catch (e) {
-          console.log(`[probe] cannot write ${cand}: ${e?.message}`);
-        }
+      // How is the preamble built? Repeated marks would mean per-chunk records rather than one header,
+      // and that changes where a descriptor could be hiding.
+      const marks = [];
+      for (let i = 0; i + 4 < Math.min(data.length, 40000); i++) {
+        const s4 = data.subarray(i, i + 4).toString("latin1");
+        if (s4 === "XZYH" || s4 === "XZYI" || s4.startsWith("XX")) marks.push(`${s4}@${i}`);
       }
-      if (!dir) return;
-      console.log(`[probe] saved -> ${dir}/${name}.zxvideo`);
+      console.log(`[probe] container marks: ${marks.slice(0, 16).join(" ") || "none"}`);
 
-      // Everything from the first start code, handed to ffmpeg as a raw Annex-B stream. Its h264
-      // demuxer resynchronises on start codes, so container headers left interleaved cost frames
-      // rather than the whole file — enough to learn whether a straight remux is all this needs.
-      await fsp.writeFile(`${dir}/${name}.h264`, data.subarray(first));
+      if (firstSps < 0) {
+        console.log("[probe] no SPS in the stream — it must live in the preamble; stopping here");
+        return;
+      }
+
+      // /data is the add-on's own volume and always real; /share needs a mapping the Supervisor has
+      // not re-read, so writing there lands inside the container and fools everyone.
+      const name = file.split("/").pop().replace(/\.zxvideo$/, "");
+      const dir = "/data";
+      try {
+        await fsp.writeFile(`${dir}/${name}.h264`, data.subarray(firstSps));
+      } catch (e) {
+        return console.log(`[probe] cannot write ${dir}: ${e?.message}`);
+      }
+      console.log(`[probe] wrote ${dir}/${name}.h264 from the SPS onward`);
+
+      const tailOf = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
       execFile(
         "ffmpeg",
         ["-y", "-f", "h264", "-i", `${dir}/${name}.h264`, "-c", "copy", `${dir}/${name}.mp4`],
-        (err, _out, errOut) => {
-          const tailOf = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-3).join(" | ");
-          console.log(`[probe] ffmpeg: ${err ? "FAILED " + tailOf(errOut) : "ok -> " + dir + "/" + name + ".mp4"}`);
-          execFile("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration,size", "-of", "default=nw=1", `${dir}/${name}.mp4`], (e2, out2, err2) => {
-            console.log(`[probe] ffprobe: ${e2 ? "REFUSED " + tailOf(err2) : String(out2).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`);
-          });
+        (err, _o, errOut) => {
+          console.log(`[probe] ffmpeg: ${err ? "FAILED " + tailOf(errOut) : "ok"}`);
+          execFile(
+            "ffprobe",
+            [
+              "-v",
+              "error",
+              "-show_entries",
+              "stream=codec_name,width,height,nb_frames:format=duration,size",
+              "-of",
+              "default=nw=1",
+              `${dir}/${name}.mp4`,
+            ],
+            (e2, out2, err2) => {
+              const shown = e2
+                ? "REFUSED " + tailOf(err2)
+                : String(out2).replace(new RegExp(String.fromCharCode(10), "g"), " ");
+              console.log(`[probe] ffprobe: ${shown}`);
+            },
+          );
         },
       );
     };
