@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.24";
+const PROBE_BUILD = "probe.25";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -74,6 +74,7 @@ export function createBoot(ctx) {
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
       await tryUnwrap(saved);
+      await tryEcies(saved);
       void kickoff("playback attempt");
     } catch {
       console.log("[probe] no saved clip yet — fetching one");
@@ -212,6 +213,102 @@ export function createBoot(ctx) {
         }
       }
     }
+    return undefined;
+  }
+
+  /**
+   * The wrap is ECIES, not RSA — reimplemented here exactly as the SDK does it for CMD_GATEWAYINFO.
+   *
+   * The RSA reading came from `decodeVideoFrame`, which is right about LIVE frames: there the client
+   * hands the camera its own modulus in `encryptkey` and gets back a 128-byte RSA block. A clip
+   * recorded weeks ago cannot have used a modulus from this session, and the numbers say what it used
+   * instead — the payload starts at 151, 151 minus the 22-byte header is 129, and 129 is exactly the
+   * envelope length `deriveLevel2KeyFromGatewayInfo` unwraps with `ecc_private_key`.
+   *
+   * That key also arrives intact, 64 hex characters, and the SDK negotiates level-2 with it daily —
+   * unlike the RSA PEM beside it, which comes back with every letter lowercased and which nothing in
+   * the SDK ever reads.
+   *
+   *   [0..32]  compressed ephemeral public key
+   *   [33..48] IV
+   *   [49..96] ciphertext, AES-128-CBC under HMAC-derived material
+   *   [97..128] HMAC-SHA256
+   */
+  function eufyKdf(shared, outLen) {
+    const hmac = (k, d) => crypto.createHmac("sha256", k).update(d).digest();
+    const label = Buffer.from("ECIES");
+    let out = Buffer.alloc(0);
+    let t = label;
+    while (out.length < outLen) {
+      t = hmac(shared, t);
+      out = Buffer.concat([out, hmac(shared, Buffer.concat([t, label]))]);
+    }
+    return out.subarray(0, outLen);
+  }
+
+  function eciesOpen(envelope, eccHex) {
+    try {
+      if (envelope.length < 97) return undefined;
+      const ecdh = crypto.createECDH("prime256v1");
+      ecdh.setPrivateKey(Buffer.from(eccHex, "hex"));
+      const shared = ecdh.computeSecret(envelope.subarray(0, 33));
+      const kdf = eufyKdf(shared, 48);
+      const d = crypto.createDecipheriv("aes-128-cbc", kdf.subarray(0, 16), envelope.subarray(33, 49));
+      d.setAutoPadding(false);
+      return Buffer.concat([d.update(envelope.subarray(49, 97)), d.final()]);
+    } catch (e) {
+      console.log(`[ecies] failed: ${String(e?.message).slice(0, 70)}`);
+      return undefined;
+    }
+  }
+
+  async function tryEcies(data) {
+    const HDR = 16;
+    const recs = [];
+    for (let i = 0; i + HDR <= data.length; ) {
+      if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
+      const len = data.readUInt32LE(i + 6);
+      recs.push({ key: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
+      i += HDR + len;
+    }
+    const kf = recs.find((r) => r.key);
+    if (!kf) return console.log("[ecies] no keyframe");
+
+    let ecc;
+    try {
+      ecc = (await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn))?.[0]?.ecc_private_key;
+    } catch (e) {
+      return console.log(`[ecies] getCiphers failed: ${e?.message ?? e}`);
+    }
+    if (!ecc) return console.log("[ecies] no ecc_private_key");
+
+    // Where the envelope sits is the one thing worth trying more than one reading of.
+    for (const [label, from, to, payloadAt] of [
+      ["22..151 (129B, payload 151)", 22, 151, 151],
+      ["22..150 (128B, payload 150)", 22, 150, 150],
+      ["0..129 (129B, payload 129)", 0, 129, 129],
+    ]) {
+      const plain = eciesOpen(kf.body.subarray(from, to), ecc);
+      if (!plain) {
+        console.log(`[ecies] ${label}: no`);
+        continue;
+      }
+      console.log(`[ecies] ${label}: unwrapped ${plain.length} bytes -> ${plain.subarray(0, 32).toString("hex")}`);
+      for (const [kl, aes] of [["first 16", plain.subarray(0, 16)], ["first 32", plain.subarray(0, 32)]]) {
+        if (aes.length < 16) continue;
+        try {
+          const d = crypto.createDecipheriv(aes.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", aes, null);
+          d.setAutoPadding(false);
+          const head = Buffer.concat([d.update(kf.body.subarray(payloadAt, payloadAt + 128)), d.final()]);
+          const ok = head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1;
+          console.log(`[ecies]    ${kl}: ${head.subarray(0, 12).toString("hex")} ${ok ? "*** START CODE, nal " + (head[4] & 0x1f) + " ***" : ""}`);
+          if (ok) return { ecc, from, to, payloadAt, keyLen: aes.length, recs };
+        } catch {
+          /* wrong length for a key */
+        }
+      }
+    }
+    console.log("[ecies] none of the readings opened it");
     return undefined;
   }
 
@@ -399,6 +496,7 @@ export function createBoot(ctx) {
       }
       await analyse(data);
       await tryUnwrap(data);
+      await tryEcies(data);
     };
 
 
