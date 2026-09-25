@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.17";
+const PROBE_BUILD = "probe.18";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -109,81 +109,56 @@ export function createBoot(ctx) {
       clipSeen = true;
       clipDone = true;
 
+      // Outer header 16 bytes; inner header 22, and now readable: length at 0, keyframe flag at 4,
+      // frame number at 6, 1280x720 at 10 and 12, a timestamp at 14. Payload starts at body+22.
       const HDR = 16;
+      const INNER = 22;
       const recs = [];
       for (let i = 0; i + HDR <= data.length; ) {
         if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
         const len = data.readUInt32LE(i + 6);
-        recs.push({ off: i, len, key: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
+        const body = data.subarray(i + HDR, i + HDR + len);
+        recs.push({ off: i, len, key: data[i + 13] === 1, no: body[6], payload: body.subarray(INNER) });
         i += HDR + len;
       }
-      console.log(`[probe] ${recs.length} records, last ends @${(recs.at(-1)?.off ?? 0) + HDR + (recs.at(-1)?.len ?? 0)}/${data.length}`);
-      if (!recs.length) return;
+      if (!recs.length) return console.log("[probe] no records");
 
-      // The inner header is 22 bytes — the 3-byte value at its start is always len-22. Sixteen of
-      // those twenty-two would be exactly an IV, which is worth seeing rather than assuming.
-      for (const r of recs.slice(0, 5)) {
-        console.log(`[probe]  inner @${String(r.off).padStart(7)} ${r.body.subarray(0, 32).toString("hex")}`);
+      // A P-frame record opened with 00 00 00 01 41 — in the clear. Does that hold for all of them,
+      // and is the keyframe the only thing encrypted?
+      const isAnnexB = (p) => p.length > 4 && p[0] === 0 && p[1] === 0 && p[2] === 0 && p[3] === 1;
+      const plain = recs.filter((r) => isAnnexB(r.payload));
+      const keyed = recs.filter((r) => r.key);
+      const plainKeyed = keyed.filter((r) => isAnnexB(r.payload));
+      console.log(
+        `[probe] ${recs.length} records: ${plain.length} start with a start code, ${recs.length - plain.length} do not`,
+      );
+      console.log(`[probe] keyframes: ${keyed.length}, of which in the clear: ${plainKeyed.length}`);
+      const nalOf = (p) => (isAnnexB(p) ? `nal ${p[4] & 0x1f} (ref ${(p[4] >> 5) & 3})` : "opaque");
+      for (const r of recs.slice(0, 3)) console.log(`[probe]   #${r.no} key=${r.key} ${nalOf(r.payload)} ${r.payload.subarray(0, 12).toString("hex")}`);
+      for (const r of recs.filter((x) => !isAnnexB(x.payload)).slice(0, 3)) {
+        console.log(`[probe]   OPAQUE #${r.no} key=${r.key} len=${r.payload.length} ${r.payload.subarray(0, 12).toString("hex")}`);
       }
 
-      // The session negotiated a 32-byte level-2 key from CMD_GATEWAYINFO, via ECIES with the same
-      // ecc_private_key getCiphers hands out. If the card reuses it, this is the whole answer.
-      const l2 = session.level2Key;
-      console.log(`[probe] level2Key: ${l2 ? `${l2.length} bytes` : "not negotiated"}`);
+      // Which NAL types does the clear part carry? An SPS among them would mean the decoder has
+      // everything it needs except the encrypted frames.
+      const types = new Map();
+      for (const r of plain) types.set(r.payload[4] & 0x1f, (types.get(r.payload[4] & 0x1f) ?? 0) + 1);
+      console.log(`[probe] clear NAL types: ${[...types].map(([t, c]) => `${t}x${c}`).join(" ")}`);
 
-      let cipher;
+      // Write what is readable and let ffmpeg judge it. Even a partial decode proves the framing is
+      // right, and its complaint names precisely what is missing.
+      const name = file.split("/").pop().replace(/\.zxvideo$/, "");
       try {
-        cipher = (await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn))?.[0];
-      } catch {
-        /* keep going with what we have */
+        await fsp.writeFile(`/data/${name}.clear.h264`, Buffer.concat(plain.map((r) => r.payload)));
+      } catch (e) {
+        return console.log(`[probe] write failed: ${e?.message}`);
       }
-
-      const keys = [];
-      if (l2?.length === 32) {
-        keys.push(["level2[32]", Buffer.from(l2)]);
-        keys.push(["level2[0:16]", Buffer.from(l2).subarray(0, 16)]);
-        keys.push(["level2[16:32]", Buffer.from(l2).subarray(16, 32)]);
-      }
-      if (cipher?.ecc_private_key && /^[0-9a-f]{64}$/i.test(cipher.ecc_private_key)) {
-        const ecc = Buffer.from(cipher.ecc_private_key, "hex");
-        keys.push(["ecc[32]", ecc], ["ecc[0:16]", ecc.subarray(0, 16)]);
-        keys.push(["ecc.sha256", crypto.createHash("sha256").update(ecc).digest()]);
-      }
-      if (!keys.length) return console.log("[probe] no key material to try");
-
-      const score = (b) => {
-        let n = 0;
-        for (let i = 0; i + 3 < b.length; i++) if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) n++;
-        return n;
-      };
-      const body = recs[0].body;
-      const zero = Buffer.alloc(16);
-      const out = [];
-      // Two readings of where the ciphertext starts, and two of what the IV is.
-      for (const [cname, start] of [["body+0", 0], ["body+22", 22]]) {
-        const ct0 = body.subarray(start, start + 8192);
-        const ct = ct0.subarray(0, ct0.length - (ct0.length % 16));
-        for (const [iname, iv] of [["iv=0", zero], ["iv=inner[0:16]", body.subarray(0, 16)]]) {
-          for (const [kname, key] of keys) {
-            const modes = key.length === 32 ? ["aes-256-cbc", "aes-256-ecb", "aes-256-ctr"] : ["aes-128-cbc", "aes-128-ecb", "aes-128-ctr"];
-            for (const mode of modes) {
-              try {
-                const d = crypto.createDecipheriv(mode, key, mode.endsWith("ecb") ? null : iv);
-                d.setAutoPadding(false);
-                const plain = Buffer.concat([d.update(ct), d.final()]);
-                out.push([score(plain), `${kname} ${mode} ${cname} ${iname}`, plain.subarray(0, 10).toString("hex")]);
-              } catch {
-                /* unusable combination */
-              }
-            }
-          }
-        }
-      }
-      out.sort((a, b) => b[0] - a[0]);
-      console.log(`[probe] baseline: ${score(body.subarray(0, 8192))}   tried ${out.length} combinations`);
-      for (const [n, what, head] of out.slice(0, 6)) {
-        console.log(`[probe]   ${String(n).padStart(4)}  ${what.padEnd(44)} ${head}`);
-      }
+      const tail = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
+      execFile(
+        "ffprobe",
+        ["-v", "error", "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "default=nw=1", `/data/${name}.clear.h264`],
+        (e, out, err) => console.log(`[probe] ffprobe(clear): ${e ? "REFUSED " + tail(err) : String(out).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`),
+      );
     };
     session.on("data", onData);
     session.on("image", onImage);
