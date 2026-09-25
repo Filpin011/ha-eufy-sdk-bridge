@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.8";
+const PROBE_BUILD = "probe.10";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -50,8 +50,15 @@ export function createBoot(ctx) {
     }
     await trySdRead(sn);
   }
+  // A battery camera drops off P2P when it sleeps, and a connect attempt then times out. One shot at
+  // twenty seconds is a coin toss, so keep knocking: every 75s, ten times, stopping as soon as the read
+  // has run. ~12 minutes of patience costs nothing and saves a restart per attempt.
+  let attempts = 0;
+  const knock = setInterval(() => {
+    if (sdTried || ++attempts > 10) return clearInterval(knock);
+    void kickoff(`attempt ${attempts}/10`);
+  }, 75000);
   setTimeout(() => void kickoff("20s after boot"), 20000);
-  setTimeout(() => void kickoff("retry at 90s"), 90000);
   /**
    * Ask the camera for files on its own SD card, in the order that makes the answer readable.
    *
@@ -92,7 +99,39 @@ export function createBoot(ctx) {
         `[probe] frame ${frame?.commandName} bytes=${frame?.data?.length ?? 0} head=${head}${js ? " json=" + js : ""}`,
       );
     };
-    const onImage = ({ file, data }) => console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
+    const onImage = async ({ file, data }) => {
+      console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
+      if (!data?.length) return;
+      // Put it somewhere reachable from outside the container, so the bytes can actually be looked at.
+      const out = `/share/eufy-probe/${file.split("/").pop()}`;
+      try {
+        await fsp.mkdir("/share/eufy-probe", { recursive: true });
+        await fsp.writeFile(out, data);
+        console.log(`[probe] saved -> ${out}`);
+      } catch (e) {
+        return console.log(`[probe] save failed (${e?.message}) — is /share mapped?`);
+      }
+      if (!file.endsWith(".zxvideo")) return;
+
+      // Is there plaintext H.264 in here? Annex-B start codes with an SPS (0x67) or IDR (0x65) nal
+      // would mean the container is a wrapper, not encryption — and a remux would be all it takes.
+      let starts = 0;
+      let sps = 0;
+      for (let i = 0; i + 4 < Math.min(data.length, 200000); i++) {
+        if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+          starts++;
+          const t = data[i + 4] & 0x1f;
+          if (t === 7 || t === 5) sps++;
+        }
+      }
+      console.log(`[probe] annex-b start codes in first 200KB: ${starts} (of which SPS/IDR: ${sps})`);
+      console.log(`[probe] header: ${data.subarray(0, 64).toString("hex")}`);
+
+      execFile("ffprobe", ["-v", "error", "-show_format", "-show_streams", out], (err, stdout, stderr) => {
+        const out2 = err ? "REFUSED: " + String(stderr || err.message).split("\n")[0] : String(stdout).slice(0, 800);
+        console.log("[probe] ffprobe: " + out2);
+      });
+    };
     session.on("data", onData);
     session.on("image", onImage);
     console.log(`[probe] station=${stationSn} account=${accountId ?? "?"}`);
@@ -101,23 +140,6 @@ export function createBoot(ctx) {
     const steps = [
       ["A: requestImage on a JPEG that exists (CONTROL)", () => session.requestImage(snapshot, { accountId })],
       ["B: requestImage on the clip", () => session.requestImage(clip, { accountId })],
-      [
-        "C: CMD_DOWNLOAD_VIDEO (1024) inside CMD_SET_PAYLOAD",
-        () =>
-          session.sendStringPayloadCommand(
-            1350,
-            wrapped(1024, { file: clip, account_id: accountId, cipher_id: 0 }),
-          ),
-      ],
-      [
-        "D: CMD_RECORDLIST_SEARCH (1042) — what does the card hold",
-        () =>
-          session.sendStringPayloadCommand(
-            1350,
-            wrapped(1042, { account_id: accountId, start_date: "20260925", channel: 0 }),
-          ),
-      ],
-      ["E: CMD_SDINFO (1102)", () => session.sendStringPayloadCommand(1350, wrapped(1102, { account_id: accountId }))],
     ];
     for (const [label, run] of steps) {
       console.log(`[probe] -- ${label}`);
