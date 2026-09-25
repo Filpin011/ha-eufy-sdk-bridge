@@ -7,6 +7,20 @@ import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
+
+  // TEMPORARY (debug branch): print the RAW push payload for the first few events, to see whether
+  // the cloud notification names a recorded clip (video_url / short_video_url / storage_path) or
+  // only a thumbnail. Bounded, so it cannot follow every detection into the log.
+  let probeLeft = 6;
+  function probePush(name, payload) {
+    if (probeLeft <= 0) return;
+    probeLeft -= 1;
+    try {
+      console.log(`[probe] push ${name}: ${JSON.stringify(payload)}`);
+    } catch (e) {
+      console.log(`[probe] push ${name}: unserialisable (${e?.message})`);
+    }
+  }
   const { flags, timers } = ctx.state;
 
   /** Spawn the bundled go2rtc against the generated config. Non-fatal if the binary isn't present (dev). */
@@ -35,6 +49,7 @@ export function createBoot(ctx) {
       }
       for (const e of FORWARDED_EVENTS)
         eufy.on(e, (payload) => {
+          probePush(e, payload);
           ctx.bumpActivity();
           const detection = DETECTION_EVENTS.has(e);
           if (detection) {
