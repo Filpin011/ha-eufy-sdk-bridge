@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.20";
+const PROBE_BUILD = "probe.21";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -20,6 +20,11 @@ export function createBoot(ctx) {
   // A real clip seen in an earlier push, so the read can be tried without waiting for someone to walk
   // in front of the camera. Override with PROBE_CLIP if this one has been rotated off the card.
   const FALLBACK_CLIP = "/media/mmcblk0p1/Camera00/event/202609/20260925/20260925142939.zxvideo";
+
+  // Once a clip has been fetched it is kept, and every later question is asked of the copy. The
+  // camera is a battery device that answers when it feels like it; re-downloading the same 450KB
+  // for each new measurement was turning a five-minute question into an afternoon.
+  const SAVED = "/data/probe-clip.zxvideo";
 
   let sdTried = false;
   let clipDone = false;
@@ -61,7 +66,79 @@ export function createBoot(ctx) {
     if (clipDone || ++attempts > 20) return clearInterval(knock);
     void kickoff(`attempt ${attempts}/10`);
   }, 75000);
-  setTimeout(() => void kickoff("20s after boot"), 20000);
+  setTimeout(async () => {
+    try {
+      const saved = await fsp.readFile(SAVED);
+      clipDone = true;
+      sdTried = true;
+      console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
+      await analyse(saved);
+    } catch {
+      console.log("[probe] no saved clip yet — fetching one");
+      void kickoff("20s after boot");
+    }
+  }, 20000);
+
+  /** Everything we know how to ask of a clip, run against bytes from anywhere. */
+  async function analyse(data) {
+
+    const HDR = 16;
+    const INNER = 22;
+    const recs = [];
+    for (let i = 0; i + HDR <= data.length; ) {
+      if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
+      const len = data.readUInt32LE(i + 6);
+      const body = data.subarray(i + HDR, i + HDR + len);
+      recs.push({ off: i, len, key: data[i + 13] === 1, no: body[6], p: body.subarray(INNER) });
+      i += HDR + len;
+    }
+    const opaqueKeys = recs.filter((r) => r.key && !(r.p[0] === 0 && r.p[1] === 0 && r.p[2] === 0 && r.p[3] === 1));
+    console.log(`[probe] ${recs.length} records, ${opaqueKeys.length} encrypted keyframes`);
+    if (opaqueKeys.length < 2) return console.log("[probe] need two keyframes to compare");
+
+    const [a, b] = opaqueKeys;
+    const n = Math.min(a.p.length, b.p.length);
+
+    // Two keyframes encrypt to the same opening bytes, so there is no per-record IV. How far the
+    // agreement runs is how much plaintext they share — an SPS and a PPS, presumably.
+    let same = 0;
+    while (same < n && a.p[same] === b.p[same]) same++;
+    console.log(`[probe] two keyframes agree for ${same} bytes, then diverge`);
+
+    // The discriminator. Under a stream cipher with a fixed keystream, C1^C2 = P1^P2 — two H.264
+    // keyframes xored, which keeps structure and measures well below 8 bits. Under a block cipher
+    // it is noise. This is the difference between a problem we can solve and one we cannot.
+    const x = Buffer.alloc(Math.min(n, 65536));
+    for (let i = 0; i < x.length; i++) x[i] = a.p[i] ^ b.p[i];
+    const H = (buf) => {
+      const f = new Array(256).fill(0);
+      for (const v of buf) f[v]++;
+      let h = 0;
+      for (const c of f) if (c) h -= (c / buf.length) * Math.log2(c / buf.length);
+      return h.toFixed(3);
+    };
+    console.log(`[probe] entropy: C1=${H(a.p.subarray(0, 65536))} C1^C2=${H(x)} (ciphertext ~7.98, xor of two frames should fall well below)`);
+    console.log(`[probe] C1^C2 zero bytes: ${x.filter((v) => v === 0).length}/${x.length}`);
+
+    // A repeating keystream would show itself as periodicity: bytes matching their own echo one
+    // period away, far more often than the 1-in-256 chance.
+    const best = [];
+    for (const period of [16, 32, 64, 128, 256, 512, 1024]) {
+      let hits = 0;
+      const upto = Math.min(a.p.length - period, 40000);
+      for (let i = 0; i < upto; i++) if (a.p[i] === a.p[i + period]) hits++;
+      best.push(`${period}:${((hits / upto) * 100).toFixed(2)}%`);
+    }
+    console.log(`[probe] self-match by period (chance is 0.39%): ${best.join(" ")}`);
+
+    // If it is a keystream, this is its opening — a keyframe must begin 00 00 00 01 67.
+    const crib = Buffer.from([0x00, 0x00, 0x00, 0x01, 0x67]);
+    const ks = Buffer.alloc(crib.length);
+    for (let i = 0; i < crib.length; i++) ks[i] = a.p[i] ^ crib[i];
+    console.log(`[probe] keystream candidate (C ^ expected SPS): ${ks.toString("hex")}`);
+    console.log(`[probe] keyframe head: ${a.p.subarray(0, 32).toString("hex")}`);
+  }
+
   /**
    * Ask the camera for files on its own SD card, in the order that makes the answer readable.
    *
@@ -108,63 +185,16 @@ export function createBoot(ctx) {
       if (!data?.length || !file.endsWith(".zxvideo")) return;
       clipSeen = true;
       clipDone = true;
-
-      const HDR = 16;
-      const INNER = 22;
-      const recs = [];
-      for (let i = 0; i + HDR <= data.length; ) {
-        if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
-        const len = data.readUInt32LE(i + 6);
-        const body = data.subarray(i + HDR, i + HDR + len);
-        recs.push({ off: i, len, key: data[i + 13] === 1, no: body[6], p: body.subarray(INNER) });
-        i += HDR + len;
+      try {
+        await fsp.writeFile(SAVED, data);
+        console.log(`[probe] kept a copy at ${SAVED} — later builds will not need the camera`);
+      } catch (e) {
+        console.log(`[probe] could not keep a copy: ${e?.message}`);
       }
-      const opaqueKeys = recs.filter((r) => r.key && !(r.p[0] === 0 && r.p[1] === 0 && r.p[2] === 0 && r.p[3] === 1));
-      console.log(`[probe] ${recs.length} records, ${opaqueKeys.length} encrypted keyframes`);
-      if (opaqueKeys.length < 2) return console.log("[probe] need two keyframes to compare");
-
-      const [a, b] = opaqueKeys;
-      const n = Math.min(a.p.length, b.p.length);
-
-      // Two keyframes encrypt to the same opening bytes, so there is no per-record IV. How far the
-      // agreement runs is how much plaintext they share — an SPS and a PPS, presumably.
-      let same = 0;
-      while (same < n && a.p[same] === b.p[same]) same++;
-      console.log(`[probe] two keyframes agree for ${same} bytes, then diverge`);
-
-      // The discriminator. Under a stream cipher with a fixed keystream, C1^C2 = P1^P2 — two H.264
-      // keyframes xored, which keeps structure and measures well below 8 bits. Under a block cipher
-      // it is noise. This is the difference between a problem we can solve and one we cannot.
-      const x = Buffer.alloc(Math.min(n, 65536));
-      for (let i = 0; i < x.length; i++) x[i] = a.p[i] ^ b.p[i];
-      const H = (buf) => {
-        const f = new Array(256).fill(0);
-        for (const v of buf) f[v]++;
-        let h = 0;
-        for (const c of f) if (c) h -= (c / buf.length) * Math.log2(c / buf.length);
-        return h.toFixed(3);
-      };
-      console.log(`[probe] entropy: C1=${H(a.p.subarray(0, 65536))} C1^C2=${H(x)} (ciphertext ~7.98, xor of two frames should fall well below)`);
-      console.log(`[probe] C1^C2 zero bytes: ${x.filter((v) => v === 0).length}/${x.length}`);
-
-      // A repeating keystream would show itself as periodicity: bytes matching their own echo one
-      // period away, far more often than the 1-in-256 chance.
-      const best = [];
-      for (const period of [16, 32, 64, 128, 256, 512, 1024]) {
-        let hits = 0;
-        const upto = Math.min(a.p.length - period, 40000);
-        for (let i = 0; i < upto; i++) if (a.p[i] === a.p[i + period]) hits++;
-        best.push(`${period}:${((hits / upto) * 100).toFixed(2)}%`);
-      }
-      console.log(`[probe] self-match by period (chance is 0.39%): ${best.join(" ")}`);
-
-      // If it is a keystream, this is its opening — a keyframe must begin 00 00 00 01 67.
-      const crib = Buffer.from([0x00, 0x00, 0x00, 0x01, 0x67]);
-      const ks = Buffer.alloc(crib.length);
-      for (let i = 0; i < crib.length; i++) ks[i] = a.p[i] ^ crib[i];
-      console.log(`[probe] keystream candidate (C ^ expected SPS): ${ks.toString("hex")}`);
-      console.log(`[probe] keyframe head: ${a.p.subarray(0, 32).toString("hex")}`);
+      await analyse(data);
     };
+
+
     session.on("data", onData);
     session.on("image", onImage);
     console.log(`[probe] station=${stationSn} account=${accountId ?? "?"}`);
