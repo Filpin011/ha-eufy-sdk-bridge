@@ -18,6 +18,24 @@ export function createBoot(ctx) {
   const FALLBACK_CLIP = "/media/mmcblk0p1/Camera00/event/202609/20260925/20260925142939.zxvideo";
 
   let sdTried = false;
+
+  // Open the camera's own P2P session instead of waiting for a viewer. An idle battery camera holds
+  // none, and the leftover ffmpeg retries against /stream are refused by the stream backoff without
+  // ever waking the radio — so nothing would ever connect on its own.
+  setTimeout(async () => {
+    if (sdTried) return;
+    try {
+      const devs = await eufy.getDevices();
+      const sn = devs[0]?.sn;
+      if (!sn) return console.log("[probe] no device to connect to");
+      console.log(`[probe] opening a P2P session to ${sn}…`);
+      await eufy.connectStation(sn);
+      console.log("[probe] session open");
+      await trySdRead(sn);
+    } catch (e) {
+      console.log(`[probe] connectStation failed: ${e?.message ?? e}`);
+    }
+  }, 20000);
   async function trySdRead(sn) {
     if (sdTried) return;
     const sessions = eufy.getP2pSessions?.() ?? new Map();
