@@ -6,7 +6,7 @@ import { spawn, execFile } from "node:child_process";
 import fsp from "node:fs/promises";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.13";
+const PROBE_BUILD = "probe.14";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -104,83 +104,48 @@ export function createBoot(ctx) {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
       if (!data?.length || !file.endsWith(".zxvideo")) return;
 
-      // A census of the elementary stream, over BOTH start-code forms — a three-byte one is easy to
-      // miss, and ffmpeg's "dimensions not set" says it found no SPS, which is exactly the NAL a
-      // scan for four-byte codes alone could have walked past.
-      const hist = new Map();
-      let firstSps = -1;
-      let firstAny = -1;
-      for (let i = 0; i + 4 < data.length; i++) {
-        let n = 0;
-        if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) n = 4;
-        else if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) n = 3;
-        if (!n) continue;
-        const t = data[i + n] & 0x1f;
-        hist.set(t, (hist.get(t) ?? 0) + 1);
-        if (firstAny < 0) firstAny = i;
-        if (t === 7 && firstSps < 0) firstSps = i;
-        i += n;
-      }
-      const NAME = { 1: "P/B slice", 5: "IDR", 6: "SEI", 7: "SPS", 8: "PPS", 9: "AUD" };
-      const census = [...hist]
-        .sort((a, b) => b[1] - a[1])
-        .map(([t, c]) => `${t}=${NAME[t] ?? "?"}x${c}`)
-        .join("  ");
-      console.log(`[probe] NAL census: ${census || "(nothing)"}`);
-      console.log(`[probe] first start code @${firstAny}, first SPS @${firstSps}`);
-      console.log(`[probe] head 128B: ${data.subarray(0, 128).toString("hex")}`);
+      // The NAL census came back near-uniform across all 32 types, which no real elementary stream
+      // looks like, and the XZYH marks repeat every ~2KB. So the file is a chain of records, and the
+      // "start codes" were their headers. Two questions remain, and both are measurable.
 
-      // How is the preamble built? Repeated marks would mean per-chunk records rather than one header,
-      // and that changes where a descriptor could be hiding.
+      // 1 — the record layout. Print what follows each mark, so the header can be read off directly.
       const marks = [];
-      for (let i = 0; i + 4 < Math.min(data.length, 40000); i++) {
-        const s4 = data.subarray(i, i + 4).toString("latin1");
-        if (s4 === "XZYH" || s4 === "XZYI" || s4.startsWith("XX")) marks.push(`${s4}@${i}`);
+      for (let i = 0; i + 4 <= data.length; i++) {
+        if (data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48) marks.push(i);
       }
-      console.log(`[probe] container marks: ${marks.slice(0, 16).join(" ") || "none"}`);
-
-      if (firstSps < 0) {
-        console.log("[probe] no SPS in the stream — it must live in the preamble; stopping here");
-        return;
+      console.log(`[probe] ${marks.length} XZYH records in ${data.length} bytes`);
+      for (const off of marks.slice(0, 6)) {
+        console.log(`[probe]   @${String(off).padStart(7)} ${data.subarray(off, off + 32).toString("hex")}`);
       }
+      const gaps = marks.slice(1, 9).map((m, i) => m - marks[i]);
+      console.log(`[probe] record sizes: ${gaps.join(" ")}`);
 
-      // /data is the add-on's own volume and always real; /share needs a mapping the Supervisor has
-      // not re-read, so writing there lands inside the container and fools everyone.
-      const name = file.split("/").pop().replace(/\.zxvideo$/, "");
-      const dir = "/data";
-      try {
-        await fsp.writeFile(`${dir}/${name}.h264`, data.subarray(firstSps));
-      } catch (e) {
-        return console.log(`[probe] cannot write ${dir}: ${e?.message}`);
+      // 2 — is the payload encrypted, or merely a codec we did not recognise? Shannon entropy tells
+      // them apart: ciphertext sits at ~8.00 bits per byte, H.264 around 7.3-7.7, and a header region
+      // much lower. Measured away from the marks, in the middle of a record.
+      const entropy = (buf) => {
+        const f = new Array(256).fill(0);
+        for (const b of buf) f[b]++;
+        let h = 0;
+        for (const c of f) if (c) h -= (c / buf.length) * Math.log2(c / buf.length);
+        return h.toFixed(3);
+      };
+      const mid = marks.length > 2 ? marks[2] + 64 : 1024;
+      console.log(`[probe] entropy: whole=${entropy(data)} payload@${mid}=${entropy(data.subarray(mid, mid + 8192))}`);
+      console.log(`[probe] payload sample: ${data.subarray(mid, mid + 48).toString("hex")}`);
+
+      // 3 — what does the account hand back for this camera's cipher? The record says cipher_id 0 and
+      // the push says 95; the SDK can fetch the material for either, and whether it answers at all
+      // decides whether decryption is a road or a wall.
+      for (const id of [95, 0]) {
+        try {
+          const got = await eufy.api?.getCiphers?.([id], lastClip?.accountId, lastClip?.stationSn);
+          const shape = (got ?? []).map((c) => Object.keys(c ?? {}).join("+")).join(" / ");
+          console.log(`[probe] getCiphers(${id}): ${got ? `${got.length} entr(y/ies) [${shape}]` : "no answer"}`);
+        } catch (e) {
+          console.log(`[probe] getCiphers(${id}) failed: ${e?.message ?? e}`);
+        }
       }
-      console.log(`[probe] wrote ${dir}/${name}.h264 from the SPS onward`);
-
-      const tailOf = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
-      execFile(
-        "ffmpeg",
-        ["-y", "-f", "h264", "-i", `${dir}/${name}.h264`, "-c", "copy", `${dir}/${name}.mp4`],
-        (err, _o, errOut) => {
-          console.log(`[probe] ffmpeg: ${err ? "FAILED " + tailOf(errOut) : "ok"}`);
-          execFile(
-            "ffprobe",
-            [
-              "-v",
-              "error",
-              "-show_entries",
-              "stream=codec_name,width,height,nb_frames:format=duration,size",
-              "-of",
-              "default=nw=1",
-              `${dir}/${name}.mp4`,
-            ],
-            (e2, out2, err2) => {
-              const shown = e2
-                ? "REFUSED " + tailOf(err2)
-                : String(out2).replace(new RegExp(String.fromCharCode(10), "g"), " ");
-              console.log(`[probe] ffprobe: ${shown}`);
-            },
-          );
-        },
-      );
     };
     session.on("data", onData);
     session.on("image", onImage);
