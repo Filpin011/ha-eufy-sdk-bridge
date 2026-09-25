@@ -2,10 +2,11 @@
 // the periodic sweeps, and flip `ready`. Guarded so it runs exactly once — a later re-auth calls it again
 // but returns immediately, so listeners and timers are never double-wired. Non-critical warm-ups are
 // kicked off after `ready` so they don't hold up serving.
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import fsp from "node:fs/promises";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.11";
+const PROBE_BUILD = "probe.12";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -103,44 +104,53 @@ export function createBoot(ctx) {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
       if (!data?.length || !file.endsWith(".zxvideo")) return;
 
-      // Read the bytes we already hold, before touching the filesystem: whether the container can be
-      // written somewhere is a separate question from what is inside it, and the first must not gate
-      // the second. Annex-B start codes carrying an SPS (7) or an IDR (5) would mean the payload is
-      // plain H.264 in a wrapper — a remux away from playable.
+      // Read what we hold before touching the filesystem: what is inside the container and where it
+      // can be written are separate questions, and the first must not wait on the second.
+      let first = -1;
       let starts = 0;
       let key = 0;
-      for (let i = 0; i + 4 < Math.min(data.length, 400000); i++) {
+      for (let i = 0; i + 4 < data.length; i++) {
         if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+          if (first < 0) first = i;
           starts++;
           const t = data[i + 4] & 0x1f;
           if (t === 7 || t === 5) key++;
         }
       }
-      console.log(`[probe] annex-b start codes: ${starts} (SPS/IDR: ${key}) in ${Math.min(data.length, 400000)} bytes`);
+      console.log(`[probe] annex-b start codes: ${starts} (SPS/IDR: ${key}), first at byte ${first}`);
       console.log(`[probe] header: ${data.subarray(0, 96).toString("hex")}`);
-      console.log(`[probe] printable head: ${JSON.stringify(data.subarray(0, 64).toString("latin1"))}`);
+      if (first < 0) return console.log("[probe] no H.264 in the clear — encrypted after all");
 
-      // /share is the useful place — reachable from outside — but it needs the add-on config the
-      // Supervisor may not have re-read yet. /data always exists, and ffprobe does not care which.
-      const name = file.split("/").pop();
-      let out;
-      for (const dir of ["/share/eufy-probe", "/data"]) {
+      const name = file.split("/").pop().replace(/.zxvideo$/, "");
+      let dir;
+      for (const cand of ["/share/eufy-probe", "/data"]) {
         try {
-          await fsp.mkdir(dir, { recursive: true });
-          await fsp.writeFile(`${dir}/${name}`, data);
-          out = `${dir}/${name}`;
-          console.log(`[probe] saved -> ${out}`);
+          await fsp.mkdir(cand, { recursive: true });
+          await fsp.writeFile(`${cand}/${name}.zxvideo`, data);
+          dir = cand;
           break;
         } catch (e) {
-          console.log(`[probe] cannot write ${dir}: ${e?.message}`);
+          console.log(`[probe] cannot write ${cand}: ${e?.message}`);
         }
       }
-      if (!out) return;
+      if (!dir) return;
+      console.log(`[probe] saved -> ${dir}/${name}.zxvideo`);
 
-      execFile("ffprobe", ["-v", "error", "-show_format", "-show_streams", out], (err, stdout, stderr) => {
-        const res = err ? "REFUSED: " + String(stderr || err.message).split("\n")[0] : String(stdout).slice(0, 700);
-        console.log("[probe] ffprobe: " + res);
-      });
+      // Everything from the first start code, handed to ffmpeg as a raw Annex-B stream. Its h264
+      // demuxer resynchronises on start codes, so container headers left interleaved cost frames
+      // rather than the whole file — enough to learn whether a straight remux is all this needs.
+      await fsp.writeFile(`${dir}/${name}.h264`, data.subarray(first));
+      execFile(
+        "ffmpeg",
+        ["-y", "-f", "h264", "-i", `${dir}/${name}.h264`, "-c", "copy", `${dir}/${name}.mp4`],
+        (err, _out, errOut) => {
+          const tailOf = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-3).join(" | ");
+          console.log(`[probe] ffmpeg: ${err ? "FAILED " + tailOf(errOut) : "ok -> " + dir + "/" + name + ".mp4"}`);
+          execFile("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration,size", "-of", "default=nw=1", `${dir}/${name}.mp4`], (e2, out2, err2) => {
+            console.log(`[probe] ffprobe: ${e2 ? "REFUSED " + tailOf(err2) : String(out2).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`);
+          });
+        },
+      );
     };
     session.on("data", onData);
     session.on("image", onImage);
