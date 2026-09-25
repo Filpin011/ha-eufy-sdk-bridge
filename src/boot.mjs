@@ -12,7 +12,66 @@ export function createBoot(ctx) {
   // the cloud notification names a recorded clip (video_url / short_video_url / storage_path) or
   // only a thumbnail. Bounded, so it cannot follow every detection into the log.
   let probeLeft = 6;
-  let lastClip; // { path, cipher, stationSn } dall'ultimo push
+  let lastClip; // { path, cipher, stationSn, accountId } dall'ultimo push
+  // A real clip seen in an earlier push, so the read can be tried without waiting for someone to walk
+  // in front of the camera. Override with PROBE_CLIP if this one has been rotated off the card.
+  const FALLBACK_CLIP = "/media/mmcblk0p1/Camera00/event/202609/20260925/20260925142939.zxvideo";
+
+  let sdTried = false;
+  async function trySdRead(sn) {
+    if (sdTried) return;
+    const sessions = eufy.getP2pSessions?.() ?? new Map();
+    const entry = sn ? [[sn, sessions.get(sn)]] : [...sessions];
+    const [stationSn, session] = entry.find(([, s2]) => s2?.isConnected) ?? [];
+    if (!session) return console.log("[probe] no connected P2P session yet — open the live view");
+    sdTried = true;
+
+    const clipPath = process.env.PROBE_CLIP || lastClip?.path || FALLBACK_CLIP;
+    let accountId = lastClip?.accountId;
+    if (!accountId) {
+      try {
+        const devs = await eufy.getDevices();
+        accountId = devs.find((d) => d.raw?.member?.admin_user_id)?.raw?.member?.admin_user_id;
+      } catch {
+        /* best effort */
+      }
+    }
+
+    let frames = 0;
+    const onData = (frame) => {
+      if (frames++ > 60) return;
+      const head = frame?.data?.subarray?.(0, 16)?.toString("hex") ?? "";
+      const js = frame?.json ? JSON.stringify(frame.json).slice(0, 300) : "";
+      console.log(
+        `[probe] frame ${frame?.commandName} bytes=${frame?.data?.length ?? 0} head=${head}${js ? " json=" + js : ""}`,
+      );
+    };
+    session.on("data", onData);
+    console.log(`[probe] station=${stationSn} account=${accountId ?? "?"} asking for ${clipPath}`);
+
+    try {
+      session.requestImage(clipPath, { accountId });
+    } catch (e) {
+      console.log(`[probe] requestImage threw: ${e?.message}`);
+    }
+    setTimeout(() => {
+      try {
+        const body = JSON.stringify({
+          commandType: 1024,
+          data: { filepath: clipPath, account_id: accountId, cipher_id: 0, type: 0 },
+        });
+        console.log("[probe] trying CMD_DOWNLOAD_VIDEO (1024)");
+        session.sendStringPayloadCommand(1024, body);
+      } catch (e) {
+        console.log(`[probe] 1024 threw: ${e?.message}`);
+      }
+    }, 6000);
+    setTimeout(() => {
+      session.off?.("data", onData);
+      console.log(`[probe] done — ${frames} frame(s) seen`);
+    }, 25000);
+  }
+
   function probePush(name, payload) {
     if (probeLeft <= 0) return;
     probeLeft -= 1;
@@ -28,6 +87,7 @@ export function createBoot(ctx) {
           accountId: rec?.account, // the push carries it; no need to derive one
         };
         console.log(`[probe] clip on SD: ${clip} (cipher=${payload?.cipher}, cipher_id=${rec?.cipher_id})`);
+        void trySdRead();
       }
     } catch (e) {
       console.log(`[probe] push ${name}: unserialisable (${e?.message})`);
@@ -62,46 +122,7 @@ export function createBoot(ctx) {
       // TEMPORARY (debug branch): when a P2P session opens, ask the camera for the last clip we saw
       // on its SD card and log EVERY frame that comes back — including a refusal, which is itself an
       // answer. Two attempts: the proven file-read primitive, then the catalogued download command.
-      let sdTried = false;
-      eufy.on("p2pConnect", (sn) => {
-        if (sdTried || !lastClip) {
-          if (!lastClip) console.log("[probe] p2pConnect but no clip path seen yet — trigger a detection first");
-          return;
-        }
-        sdTried = true;
-        const session = eufy.getP2pSessions?.().get(sn);
-        if (!session) return console.log(`[probe] no session object for ${sn}`);
-        let frames = 0;
-        const onData = (frame) => {
-          if (frames++ > 60) return;
-          const head = frame?.data?.subarray?.(0, 16)?.toString("hex") ?? "";
-          const js = frame?.json ? JSON.stringify(frame.json).slice(0, 300) : "";
-          console.log(`[probe] frame ${frame?.commandName} bytes=${frame?.data?.length ?? 0} head=${head}${js ? " json=" + js : ""}`);
-        };
-        session.on("data", onData);
-        console.log(`[probe] asking ${sn} for ${lastClip.path}`);
-        try {
-          session.requestImage(lastClip.path, { accountId: lastClip.accountId });
-        } catch (e) {
-          console.log(`[probe] requestImage threw: ${e?.message}`);
-        }
-        setTimeout(() => {
-          try {
-            const body = JSON.stringify({
-              commandType: 1024,
-              data: { filepath: lastClip.path, account_id: lastClip.accountId, cipher_id: 0, type: 0 },
-            });
-            console.log("[probe] trying CMD_DOWNLOAD_VIDEO (1024)");
-            session.sendStringPayloadCommand(1024, body);
-          } catch (e) {
-            console.log(`[probe] 1024 threw: ${e?.message}`);
-          }
-        }, 6000);
-        setTimeout(() => {
-          session.off?.("data", onData);
-          console.log(`[probe] done — ${frames} frame(s) seen`);
-        }, 25000);
-      });
+      eufy.on("p2pConnect", (sn) => void trySdRead(sn));
 
       for (const e of FORWARDED_EVENTS)
         eufy.on(e, (payload) => {
