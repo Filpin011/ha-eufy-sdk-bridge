@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.22";
+const PROBE_BUILD = "probe.23";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -73,6 +73,7 @@ export function createBoot(ctx) {
       haveClip = true; // the bytes are in hand; what is still wanted is playback
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
+      await tryUnwrap(saved);
       void kickoff("playback attempt");
     } catch {
       console.log("[probe] no saved clip yet — fetching one");
@@ -148,6 +149,100 @@ export function createBoot(ctx) {
     session.off?.("media", onMedia);
     session.off?.("audio", onAudio);
     console.log(`[play] totals: ${JSON.stringify(heard)}`);
+  }
+
+  /**
+   * Undo the wrapping the way the SDK already does it for a live keyframe.
+   *
+   * `decodeVideoFrame` gives the layout away: 22 bytes of header whose first four are the data
+   * length, then — when the frame is signed and long enough — 128 bytes of an RSA-wrapped AES key,
+   * then the payload from byte 151, of which only the first 128 bytes are AES-ECB encrypted and the
+   * rest is already plain.
+   *
+   * The record header we mapped in this file IS that 22-byte frame header: its first four bytes are
+   * `payload_len - 22`, exactly the field that function reads. So a stored keyframe is a live
+   * keyframe written to disk, and the only question is whose key wraps it. For live the SDK hands the
+   * camera its own modulus; for something recorded months ago it can only be the account's, which is
+   * the 920-character PEM `getCiphers` returns and which was dismissed earlier for not being a
+   * symmetric key.
+   */
+  async function tryUnwrap(data) {
+    const HDR = 16;
+    const recs = [];
+    for (let i = 0; i + HDR <= data.length; ) {
+      if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
+      const len = data.readUInt32LE(i + 6);
+      recs.push({ key: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
+      i += HDR + len;
+    }
+    const kf = recs.find((r) => r.key);
+    if (!kf) return console.log("[key] no keyframe record");
+
+    const declared = kf.body.readUInt32LE(0);
+    console.log(`[key] keyframe body ${kf.body.length}, header says ${declared} (+22 = ${declared + 22})`);
+
+    let pem;
+    try {
+      const got = await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn);
+      pem = got?.[0]?.private_key;
+    } catch (e) {
+      return console.log(`[key] getCiphers failed: ${e?.message ?? e}`);
+    }
+    if (!pem) return console.log("[key] no private_key");
+    console.log(`[key] PEM starts: ${String(pem).slice(0, 28).replace(/\n/g, " ")}`);
+
+    const wrapped = kf.body.subarray(22, 150);
+    let aes;
+    for (const padding of [crypto.constants.RSA_PKCS1_PADDING, crypto.constants.RSA_NO_PADDING]) {
+      try {
+        aes = crypto.privateDecrypt({ key: pem, padding }, wrapped);
+        console.log(`[key] unwrapped ${aes.length} bytes with padding ${padding}: ${aes.subarray(0, 32).toString("hex")}`);
+        break;
+      } catch (e) {
+        console.log(`[key] padding ${padding} failed: ${String(e?.message).slice(0, 80)}`);
+        aes = undefined;
+      }
+    }
+    if (!aes?.length) return;
+
+    // Exactly what decodeVideoFrame does: the first 128 bytes after the wrap are AES-ECB, the tail is
+    // already plain, and the two are concatenated.
+    const start = 151;
+    const use256 = aes.length >= 32;
+    try {
+      const d = crypto.createDecipheriv(use256 ? "aes-256-ecb" : "aes-128-ecb", aes.subarray(0, use256 ? 32 : 16), null);
+      d.setAutoPadding(false);
+      const head = Buffer.concat([d.update(kf.body.subarray(start, start + 128)), d.final()]);
+      console.log(`[key] decrypted head: ${head.subarray(0, 32).toString("hex")}`);
+      const ok = head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1;
+      console.log(`[key] ${ok ? "*** START CODE — nal " + (head[4] & 0x1f) + " — THE CLIP IS OPEN ***" : "no start code; not this shape yet"}`);
+      if (!ok) return;
+
+      // Rebuild the whole clip: every keyframe unwrapped, every other record already plain.
+      const out = [];
+      for (const r of recs) {
+        if (!r.key) {
+          out.push(r.body.subarray(22));
+          continue;
+        }
+        const w = crypto.privateDecrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, r.body.subarray(22, 150));
+        const dd = crypto.createDecipheriv(w.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", w.subarray(0, w.length >= 32 ? 32 : 16), null);
+        dd.setAutoPadding(false);
+        out.push(Buffer.concat([dd.update(r.body.subarray(151, 279)), dd.final(), r.body.subarray(279)]));
+      }
+      const h264 = Buffer.concat(out);
+      await fsp.writeFile("/data/clip.h264", h264);
+      console.log(`[key] wrote /data/clip.h264 (${h264.length} bytes)`);
+      execFile("ffmpeg", ["-y", "-f", "h264", "-i", "/data/clip.h264", "-c", "copy", "/data/clip.mp4"], (e, _o, se) => {
+        const t = (x) => String(x).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
+        console.log(`[key] ffmpeg: ${e ? "FAILED " + t(se) : "ok -> /data/clip.mp4"}`);
+        execFile("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration", "-of", "default=nw=1", "/data/clip.mp4"], (e2, o2, s2) => {
+          console.log(`[key] ffprobe: ${e2 ? "REFUSED " + t(s2) : String(o2).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`);
+        });
+      });
+    } catch (e) {
+      console.log(`[key] decrypt failed: ${e?.message}`);
+    }
   }
 
   /** Everything we know how to ask of a clip, run against bytes from anywhere. */
@@ -263,6 +358,7 @@ export function createBoot(ctx) {
         console.log(`[probe] could not keep a copy: ${e?.message}`);
       }
       await analyse(data);
+      await tryUnwrap(data);
     };
 
 
