@@ -5,6 +5,8 @@
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
+const PROBE_BUILD = "probe.7";
+
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
 
@@ -22,20 +24,34 @@ export function createBoot(ctx) {
   // Open the camera's own P2P session instead of waiting for a viewer. An idle battery camera holds
   // none, and the leftover ffmpeg retries against /stream are refused by the stream backoff without
   // ever waking the radio — so nothing would ever connect on its own.
-  setTimeout(async () => {
-    if (sdTried) return;
+  //
+  // Every step announces itself: the previous attempt printed nothing at all, which could equally mean
+  // the code was absent or a call never returned. Silence must not be ambiguous.
+  console.log(`[probe] armed (build ${PROBE_BUILD})`);
+  async function kickoff(why) {
+    console.log(`[probe] kickoff: ${why}`);
+    if (sdTried) return console.log("[probe] already ran");
+    let devs;
     try {
-      const devs = await eufy.getDevices();
-      const sn = devs[0]?.sn;
-      if (!sn) return console.log("[probe] no device to connect to");
-      console.log(`[probe] opening a P2P session to ${sn}…`);
+      console.log("[probe] listing devices…");
+      devs = await eufy.getDevices();
+    } catch (e) {
+      return console.log(`[probe] getDevices failed: ${e?.message ?? e}`);
+    }
+    console.log(`[probe] devices: ${devs.map((d) => d?.sn).filter(Boolean).join(", ") || "(none)"}`);
+    const sn = devs[0]?.sn;
+    if (!sn) return;
+    try {
+      console.log(`[probe] connectStation(${sn})…`);
       await eufy.connectStation(sn);
       console.log("[probe] session open");
-      await trySdRead(sn);
     } catch (e) {
       console.log(`[probe] connectStation failed: ${e?.message ?? e}`);
     }
-  }, 20000);
+    await trySdRead(sn);
+  }
+  setTimeout(() => void kickoff("20s after boot"), 20000);
+  setTimeout(() => void kickoff("retry at 90s"), 90000);
   async function trySdRead(sn) {
     if (sdTried) return;
     const sessions = eufy.getP2pSessions?.() ?? new Map();
