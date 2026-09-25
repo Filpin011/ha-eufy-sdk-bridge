@@ -4,9 +4,10 @@
 // kicked off after `ready` so they don't hold up serving.
 import { spawn, execFile } from "node:child_process";
 import fsp from "node:fs/promises";
+import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.14";
+const PROBE_BUILD = "probe.15";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -104,47 +105,88 @@ export function createBoot(ctx) {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
       if (!data?.length || !file.endsWith(".zxvideo")) return;
 
-      // The NAL census came back near-uniform across all 32 types, which no real elementary stream
-      // looks like, and the XZYH marks repeat every ~2KB. So the file is a chain of records, and the
-      // "start codes" were their headers. Two questions remain, and both are measurable.
-
-      // 1 — the record layout. Print what follows each mark, so the header can be read off directly.
-      const marks = [];
-      for (let i = 0; i + 4 <= data.length; i++) {
-        if (data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48) marks.push(i);
+      // The container is understood: XZYH, two constant bytes, a 4-byte payload length at offset 6,
+      // a keyframe flag at 13, then a 22-byte inner header. Entropy of the payload measured 7.968
+      // against 7.982 for random bytes, so it is encrypted — and getCiphers hands over key material
+      // for cipher 95. What is left is which transform turns one into the other.
+      const HDR = 16;
+      const recs = [];
+      for (let i = 0; i + HDR <= data.length; ) {
+        if (!(data[i] === 0x58 && data[i + 1] === 0x5a && data[i + 2] === 0x59 && data[i + 3] === 0x48)) break;
+        const len = data.readUInt32LE(i + 6);
+        recs.push({ off: i, len, keyframe: data[i + 13] === 1, body: data.subarray(i + HDR, i + HDR + len) });
+        i += HDR + len;
       }
-      console.log(`[probe] ${marks.length} XZYH records in ${data.length} bytes`);
-      for (const off of marks.slice(0, 6)) {
-        console.log(`[probe]   @${String(off).padStart(7)} ${data.subarray(off, off + 32).toString("hex")}`);
+      console.log(`[probe] parsed ${recs.length} records cleanly (last ends @${recs.at(-1)?.off + HDR + recs.at(-1)?.len} of ${data.length})`);
+      if (!recs.length) return;
+
+      let cipher;
+      try {
+        const got = await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn);
+        cipher = got?.[0];
+      } catch (e) {
+        return console.log(`[probe] getCiphers failed: ${e?.message ?? e}`);
       }
-      const gaps = marks.slice(1, 9).map((m, i) => m - marks[i]);
-      console.log(`[probe] record sizes: ${gaps.join(" ")}`);
+      if (!cipher) return console.log("[probe] no cipher material");
+      const shapeOf = (v) =>
+        typeof v !== "string"
+          ? typeof v
+          : `${v.length}ch ${/^[0-9a-f]+$/i.test(v) ? "hex" : /^[A-Za-z0-9+/=]+$/.test(v) ? "base64?" : "other"}`;
+      console.log(`[probe] private_key: ${shapeOf(cipher.private_key)}  ecc: ${shapeOf(cipher.ecc_private_key)}`);
 
-      // 2 — is the payload encrypted, or merely a codec we did not recognise? Shannon entropy tells
-      // them apart: ciphertext sits at ~8.00 bits per byte, H.264 around 7.3-7.7, and a header region
-      // much lower. Measured away from the marks, in the middle of a record.
-      const entropy = (buf) => {
-        const f = new Array(256).fill(0);
-        for (const b of buf) f[b]++;
-        let h = 0;
-        for (const c of f) if (c) h -= (c / buf.length) * Math.log2(c / buf.length);
-        return h.toFixed(3);
-      };
-      const mid = marks.length > 2 ? marks[2] + 64 : 1024;
-      console.log(`[probe] entropy: whole=${entropy(data)} payload@${mid}=${entropy(data.subarray(mid, mid + 8192))}`);
-      console.log(`[probe] payload sample: ${data.subarray(mid, mid + 48).toString("hex")}`);
-
-      // 3 — what does the account hand back for this camera's cipher? The record says cipher_id 0 and
-      // the push says 95; the SDK can fetch the material for either, and whether it answers at all
-      // decides whether decryption is a road or a wall.
-      for (const id of [95, 0]) {
+      // Candidate keys, from the plausible readings of that material.
+      const bufs = (v) => {
+        const out = [];
+        if (typeof v !== "string") return out;
+        out.push(Buffer.from(v, "utf8"));
+        if (/^[0-9a-f]+$/i.test(v) && v.length % 2 === 0) out.push(Buffer.from(v, "hex"));
         try {
-          const got = await eufy.api?.getCiphers?.([id], lastClip?.accountId, lastClip?.stationSn);
-          const shape = (got ?? []).map((c) => Object.keys(c ?? {}).join("+")).join(" / ");
-          console.log(`[probe] getCiphers(${id}): ${got ? `${got.length} entr(y/ies) [${shape}]` : "no answer"}`);
-        } catch (e) {
-          console.log(`[probe] getCiphers(${id}) failed: ${e?.message ?? e}`);
+          out.push(Buffer.from(v, "base64"));
+        } catch {
+          /* not base64 */
         }
+        return out;
+      };
+      const keys = [];
+      for (const [name, v] of [["private_key", cipher.private_key], ["ecc", cipher.ecc_private_key]]) {
+        bufs(v).forEach((b, i) => {
+          if (b.length >= 16) keys.push([`${name}#${i}[0:16]`, b.subarray(0, 16)]);
+          keys.push([`${name}#${i}.md5`, crypto.createHash("md5").update(b).digest()]);
+        });
+      }
+      // The serial is the other thing both ends always know.
+      const sn = lastClip?.stationSn ?? "";
+      keys.push(["sn.md5", crypto.createHash("md5").update(sn).digest()]);
+      keys.push(["sn[0:16]", Buffer.concat([Buffer.from(sn, "utf8"), Buffer.alloc(16)]).subarray(0, 16)]);
+
+      // Scoring: a correct decryption of a keyframe payload shows Annex-B start codes; a wrong one
+      // stays noise. Counting them is a sharper test than eyeballing bytes.
+      const score = (buf) => {
+        let n = 0;
+        for (let i = 0; i + 3 < buf.length; i++) {
+          if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) n++;
+        }
+        return n;
+      };
+      const body = recs[0].body.subarray(0, 8192 - (8192 % 16));
+      const zero = Buffer.alloc(16);
+      const results = [];
+      for (const [kname, key] of keys) {
+        for (const mode of ["aes-128-cbc", "aes-128-ecb", "aes-128-ctr"]) {
+          try {
+            const d = crypto.createDecipheriv(mode, key, mode === "aes-128-ecb" ? null : zero);
+            d.setAutoPadding(false);
+            const out = Buffer.concat([d.update(body), d.final()]);
+            results.push([score(out), `${kname} ${mode}`, out.subarray(0, 12).toString("hex")]);
+          } catch (e) {
+            results.push([-1, `${kname} ${mode}`, `err ${e?.message?.slice(0, 30)}`]);
+          }
+        }
+      }
+      results.sort((a, b) => b[0] - a[0]);
+      console.log(`[probe] baseline (undecrypted) score: ${score(body)}`);
+      for (const [n, what, head] of results.slice(0, 8)) {
+        console.log(`[probe]   ${String(n).padStart(4)}  ${what.padEnd(28)} ${head}`);
       }
     };
     session.on("data", onData);
