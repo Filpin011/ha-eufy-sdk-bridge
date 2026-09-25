@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.10";
+const PROBE_BUILD = "probe.11";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -101,35 +101,45 @@ export function createBoot(ctx) {
     };
     const onImage = async ({ file, data }) => {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
-      if (!data?.length) return;
-      // Put it somewhere reachable from outside the container, so the bytes can actually be looked at.
-      const out = `/share/eufy-probe/${file.split("/").pop()}`;
-      try {
-        await fsp.mkdir("/share/eufy-probe", { recursive: true });
-        await fsp.writeFile(out, data);
-        console.log(`[probe] saved -> ${out}`);
-      } catch (e) {
-        return console.log(`[probe] save failed (${e?.message}) — is /share mapped?`);
-      }
-      if (!file.endsWith(".zxvideo")) return;
+      if (!data?.length || !file.endsWith(".zxvideo")) return;
 
-      // Is there plaintext H.264 in here? Annex-B start codes with an SPS (0x67) or IDR (0x65) nal
-      // would mean the container is a wrapper, not encryption — and a remux would be all it takes.
+      // Read the bytes we already hold, before touching the filesystem: whether the container can be
+      // written somewhere is a separate question from what is inside it, and the first must not gate
+      // the second. Annex-B start codes carrying an SPS (7) or an IDR (5) would mean the payload is
+      // plain H.264 in a wrapper — a remux away from playable.
       let starts = 0;
-      let sps = 0;
-      for (let i = 0; i + 4 < Math.min(data.length, 200000); i++) {
+      let key = 0;
+      for (let i = 0; i + 4 < Math.min(data.length, 400000); i++) {
         if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
           starts++;
           const t = data[i + 4] & 0x1f;
-          if (t === 7 || t === 5) sps++;
+          if (t === 7 || t === 5) key++;
         }
       }
-      console.log(`[probe] annex-b start codes in first 200KB: ${starts} (of which SPS/IDR: ${sps})`);
-      console.log(`[probe] header: ${data.subarray(0, 64).toString("hex")}`);
+      console.log(`[probe] annex-b start codes: ${starts} (SPS/IDR: ${key}) in ${Math.min(data.length, 400000)} bytes`);
+      console.log(`[probe] header: ${data.subarray(0, 96).toString("hex")}`);
+      console.log(`[probe] printable head: ${JSON.stringify(data.subarray(0, 64).toString("latin1"))}`);
+
+      // /share is the useful place — reachable from outside — but it needs the add-on config the
+      // Supervisor may not have re-read yet. /data always exists, and ffprobe does not care which.
+      const name = file.split("/").pop();
+      let out;
+      for (const dir of ["/share/eufy-probe", "/data"]) {
+        try {
+          await fsp.mkdir(dir, { recursive: true });
+          await fsp.writeFile(`${dir}/${name}`, data);
+          out = `${dir}/${name}`;
+          console.log(`[probe] saved -> ${out}`);
+          break;
+        } catch (e) {
+          console.log(`[probe] cannot write ${dir}: ${e?.message}`);
+        }
+      }
+      if (!out) return;
 
       execFile("ffprobe", ["-v", "error", "-show_format", "-show_streams", out], (err, stdout, stderr) => {
-        const out2 = err ? "REFUSED: " + String(stderr || err.message).split("\n")[0] : String(stdout).slice(0, 800);
-        console.log("[probe] ffprobe: " + out2);
+        const res = err ? "REFUSED: " + String(stderr || err.message).split("\n")[0] : String(stdout).slice(0, 700);
+        console.log("[probe] ffprobe: " + res);
       });
     };
     session.on("data", onData);
