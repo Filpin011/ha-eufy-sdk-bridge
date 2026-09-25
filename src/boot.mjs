@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.21";
+const PROBE_BUILD = "probe.22";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -28,6 +28,7 @@ export function createBoot(ctx) {
 
   let sdTried = false;
   let clipDone = false;
+  let haveClip = false;
 
   // Open the camera's own P2P session instead of waiting for a viewer. An idle battery camera holds
   // none, and the leftover ffmpeg retries against /stream are refused by the stream backoff without
@@ -69,8 +70,7 @@ export function createBoot(ctx) {
   setTimeout(async () => {
     try {
       const saved = await fsp.readFile(SAVED);
-      clipDone = true;
-      sdTried = true;
+      haveClip = true; // the bytes are in hand; what is still wanted is playback
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
     } catch {
@@ -78,6 +78,76 @@ export function createBoot(ctx) {
       void kickoff("20s after boot");
     }
   }, 20000);
+
+  /**
+   * Ask the camera to play a recording back, rather than asking for its file.
+   *
+   * The key never has to be ours: the app does not decrypt anything either — it asks for playback and
+   * the camera sends frames. Those commands are in the catalogue precisely because the app uses them.
+   *
+   * The earlier attempts at them answered -104, and the reason is now plain. requestImage, which
+   * works, wraps `{account_id, cmd, mChannel, payload: [{…}], transaction}` — account id at the top,
+   * a channel, an ARRAY payload and a correlation string. The attempts sent `{cmd, payload: {…}}`.
+   * That was a malformed envelope, not a refusal.
+   */
+  async function tryPlayback(session, clipPath, accountId) {
+    const heard = { data: 0, video: 0, media: 0, audio: 0 };
+    const onData = (f) => {
+      heard.data++;
+      const js = f?.json ? JSON.stringify(f.json).slice(0, 240) : "";
+      if (heard.data <= 40) {
+        console.log(`[play] frame ${f?.commandName} bytes=${f?.data?.length ?? 0}${js ? " json=" + js : ""}`);
+      }
+    };
+    const onVideo = (v) => {
+      heard.video++;
+      if (heard.video <= 5) console.log(`[play] VIDEO frame ${v?.data?.length ?? v?.length ?? "?"} bytes`);
+    };
+    const onMedia = (m) => {
+      heard.media++;
+      if (heard.media <= 5) console.log(`[play] MEDIA ${JSON.stringify(m)?.slice(0, 160)}`);
+    };
+    const onAudio = () => heard.audio++;
+    session.on("data", onData);
+    session.on("video", onVideo);
+    session.on("media", onMedia);
+    session.on("audio", onAudio);
+
+    const day = clipPath.split("/").at(-2) ?? "";
+    const stamp = (clipPath.split("/").pop() ?? "").replace(".zxvideo", "");
+    // Same envelope as the working call; only the command and its payload change.
+    const envelope = (cmd, payload) =>
+      JSON.stringify({ account_id: accountId ?? "", cmd, mChannel: 0, payload, transaction: clipPath });
+    const asks = [
+      ["1024 CMD_DOWNLOAD_VIDEO", 1024, [{ file: clipPath }]],
+      ["1025 CMD_RECORD_VIEW", 1025, [{ file: clipPath }]],
+      ["1042 CMD_RECORDLIST_SEARCH", 1042, [{ date: day }]],
+      ["1041 CMD_RECORDDATE_SEARCH", 1041, [{ month: day.slice(0, 6) }]],
+      ["1024 with a start time", 1024, [{ file: clipPath, start_time: stamp, type: 0 }]],
+    ];
+
+    for (const [label, cmd, payload] of asks) {
+      const before = { ...heard };
+      console.log(`[play] ── ${label}`);
+      try {
+        session.sendStringPayloadCommand(1350, envelope(cmd, payload));
+      } catch (e) {
+        console.log(`[play]    threw: ${e?.message}`);
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 14000));
+      console.log(
+        `[play]    +${heard.data - before.data} frames, +${heard.video - before.video} video, ` +
+          `+${heard.media - before.media} media, +${heard.audio - before.audio} audio`,
+      );
+    }
+
+    session.off?.("data", onData);
+    session.off?.("video", onVideo);
+    session.off?.("media", onMedia);
+    session.off?.("audio", onAudio);
+    console.log(`[play] totals: ${JSON.stringify(heard)}`);
+  }
 
   /** Everything we know how to ask of a clip, run against bytes from anywhere. */
   async function analyse(data) {
@@ -226,7 +296,9 @@ export function createBoot(ctx) {
       ["B2: the clip again", () => session.requestImage(clip, { accountId })],
       ["B3: the clip once more", () => session.requestImage(clip, { accountId })],
     ];
+    if (haveClip) console.log("[probe] clip already in hand — skipping the fetch, going to playback");
     for (const [label, run] of steps) {
+      if (haveClip) break;
       if (clipSeen) break;
       console.log(`[probe] -- ${label}`);
       try {
@@ -236,9 +308,13 @@ export function createBoot(ctx) {
       }
       await new Promise((r) => setTimeout(r, 9000));
     }
+    // The file is in hand (or not); either way, ask the camera to play it instead.
+    await tryPlayback(session, clip, accountId);
+
     session.off?.("data", onData);
     session.off?.("image", onImage);
-    if (!clipSeen) {
+    clipDone = true; // playback was attempted on a live session; that was the point of connecting
+    if (!clipSeen && !haveClip) {
       // The transfer never landed — the camera went back to sleep mid-probe. That is a reason to
       // try again, not to call the attempt spent.
       sdTried = false;
