@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.23";
+const PROBE_BUILD = "probe.24";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -166,6 +166,55 @@ export function createBoot(ctx) {
    * the 920-character PEM `getCiphers` returns and which was dismissed earlier for not being a
    * symmetric key.
    */
+  /**
+   * The PEM comes back lowercased — `-----begin rsa private key-----` — and OpenSSL will not read
+   * that. Whether only the markers are lowercase or the base64 body too decides everything: markers
+   * are cosmetic, a lowercased body is a destroyed key.
+   *
+   * Reports the shape without printing the secret, then tries the readings that could work.
+   */
+  function pemCandidates(raw) {
+    const s = String(raw);
+    const lines = s.split(/\r?\n/).filter(Boolean);
+    const body = lines.filter((l) => !l.includes("-----")).join("");
+    const hasUpper = /[A-Z]/.test(body);
+    const has62 = /[+/]/.test(body);
+    console.log(
+      `[key] PEM: ${s.length} chars, ${lines.length} lines, body ${body.length} chars, ` +
+        `uppercase in body: ${hasUpper}, +/ present: ${has62}`,
+    );
+    if (!hasUpper) {
+      console.log("[key] the body has no uppercase at all — the whole string was lowercased, so the key itself is lost");
+    }
+
+    const out = [];
+    // Markers uppercased, body untouched.
+    out.push(["markers uppercased", s.replace(/-----(begin|end) ([a-z ]+)-----/g, (_m, k, t) => `-----${k.toUpperCase()} ${t.toUpperCase()}-----`)]);
+    // Rebuilt from the body, as PKCS#1 and as PKCS#8, 64 characters to a line.
+    const wrapped = (body.match(/.{1,64}/g) ?? []).join("\n");
+    out.push(["rebuilt PKCS#1", `-----BEGIN RSA PRIVATE KEY-----\n${wrapped}\n-----END RSA PRIVATE KEY-----\n`]);
+    out.push(["rebuilt PKCS#8", `-----BEGIN PRIVATE KEY-----\n${wrapped}\n-----END PRIVATE KEY-----\n`]);
+    out.push(["as received", s]);
+    return out;
+  }
+
+  /** Unwrap a 128-byte RSA-wrapped AES key, trying each reading of the PEM until one parses. */
+  function unwrapKey(wrapped, rawPem) {
+    for (const [label, pem] of pemCandidates(rawPem)) {
+      for (const padding of [crypto.constants.RSA_PKCS1_PADDING, crypto.constants.RSA_NO_PADDING]) {
+        try {
+          const k = crypto.privateDecrypt({ key: pem, padding }, wrapped);
+          console.log(`[key] ${label} + padding ${padding} -> ${k.length} bytes: ${k.subarray(0, 32).toString("hex")}`);
+          return k;
+        } catch (e) {
+          const msg = String(e?.message).slice(0, 60);
+          console.log(`[key] ${label} + padding ${padding}: ${msg}`);
+        }
+      }
+    }
+    return undefined;
+  }
+
   async function tryUnwrap(data) {
     const HDR = 16;
     const recs = [];
@@ -192,17 +241,7 @@ export function createBoot(ctx) {
     console.log(`[key] PEM starts: ${String(pem).slice(0, 28).replace(/\n/g, " ")}`);
 
     const wrapped = kf.body.subarray(22, 150);
-    let aes;
-    for (const padding of [crypto.constants.RSA_PKCS1_PADDING, crypto.constants.RSA_NO_PADDING]) {
-      try {
-        aes = crypto.privateDecrypt({ key: pem, padding }, wrapped);
-        console.log(`[key] unwrapped ${aes.length} bytes with padding ${padding}: ${aes.subarray(0, 32).toString("hex")}`);
-        break;
-      } catch (e) {
-        console.log(`[key] padding ${padding} failed: ${String(e?.message).slice(0, 80)}`);
-        aes = undefined;
-      }
-    }
+    const aes = unwrapKey(wrapped, pem);
     if (!aes?.length) return;
 
     // Exactly what decodeVideoFrame does: the first 128 bytes after the wrap are AES-ECB, the tail is
@@ -225,7 +264,8 @@ export function createBoot(ctx) {
           out.push(r.body.subarray(22));
           continue;
         }
-        const w = crypto.privateDecrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, r.body.subarray(22, 150));
+        const w = unwrapKey(r.body.subarray(22, 150), pem);
+        if (!w) continue;
         const dd = crypto.createDecipheriv(w.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", w.subarray(0, w.length >= 32 ? 32 : 16), null);
         dd.setAutoPadding(false);
         out.push(Buffer.concat([dd.update(r.body.subarray(151, 279)), dd.final(), r.body.subarray(279)]));
