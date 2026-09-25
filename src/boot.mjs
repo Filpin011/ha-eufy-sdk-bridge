@@ -73,6 +73,7 @@ export function createBoot(ctx) {
       haveClip = true; // the bytes are in hand; what is still wanted is playback
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
+      void kickoff("playback attempt");
     } catch {
       console.log("[probe] no saved clip yet — fetching one");
       void kickoff("20s after boot");
