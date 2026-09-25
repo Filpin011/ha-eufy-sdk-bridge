@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.15";
+const PROBE_BUILD = "probe.16";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -22,6 +22,7 @@ export function createBoot(ctx) {
   const FALLBACK_CLIP = "/media/mmcblk0p1/Camera00/event/202609/20260925/20260925142939.zxvideo";
 
   let sdTried = false;
+  let clipDone = false;
 
   // Open the camera's own P2P session instead of waiting for a viewer. An idle battery camera holds
   // none, and the leftover ffmpeg retries against /stream are refused by the stream backoff without
@@ -57,7 +58,7 @@ export function createBoot(ctx) {
   // has run. ~12 minutes of patience costs nothing and saves a restart per attempt.
   let attempts = 0;
   const knock = setInterval(() => {
-    if (sdTried || ++attempts > 10) return clearInterval(knock);
+    if (clipDone || ++attempts > 20) return clearInterval(knock);
     void kickoff(`attempt ${attempts}/10`);
   }, 75000);
   setTimeout(() => void kickoff("20s after boot"), 20000);
@@ -101,9 +102,12 @@ export function createBoot(ctx) {
         `[probe] frame ${frame?.commandName} bytes=${frame?.data?.length ?? 0} head=${head}${js ? " json=" + js : ""}`,
       );
     };
+    let clipSeen = false;
     const onImage = async ({ file, data }) => {
       console.log(`[probe] IMAGE ${file} -> ${data?.length ?? 0} bytes`);
       if (!data?.length || !file.endsWith(".zxvideo")) return;
+      clipSeen = true;
+      clipDone = true;
 
       // The container is understood: XZYH, two constant bytes, a 4-byte payload length at offset 6,
       // a keyframe flag at 13, then a 22-byte inner header. Entropy of the payload measured 7.968
@@ -209,6 +213,12 @@ export function createBoot(ctx) {
     }
     session.off?.("data", onData);
     session.off?.("image", onImage);
+    if (!clipSeen) {
+      // The transfer never landed — the camera went back to sleep mid-probe. That is a reason to
+      // try again, not to call the attempt spent.
+      sdTried = false;
+      console.log("[probe] no clip arrived — re-arming");
+    }
     console.log(`[probe] done — ${frames} frame(s) seen`);
   }
 
