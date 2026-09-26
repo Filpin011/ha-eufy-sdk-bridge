@@ -146,7 +146,9 @@ export function createSolix(ctx) {
     const devices = await discoverSolixDevices(st.client);
     st.devices = new Map(devices.map((d) => [d.serial, d]));
     st.status = "ready";
-    console.log(`[bridge] solix ready — ${devices.length} device(s): ${devices.map((d) => `${d.productCode}/${d.serial}`).join(", ") || "none"}`);
+    console.log(
+      `[bridge] solix ready — ${devices.length} device(s): ${devices.map((d) => `${d.productCode}/${d.serial}`).join(", ") || "none"}`,
+    );
     ctx.broadcast({ event: "solixReady", devices: solixDeviceList() });
 
     // Live telemetry over the shared AWS-IoT broker (same transport the eufy path uses).
@@ -203,7 +205,12 @@ export function createSolix(ctx) {
           const dev = st.devices.get(r.deviceSn);
           if (!dev) continue;
           dev.applyReading(r);
-          ctx.broadcast({ event: "solixReading", deviceSn: r.deviceSn, productCode: dev.productCode, values: r.values });
+          ctx.broadcast({
+            event: "solixReading",
+            deviceSn: r.deviceSn,
+            productCode: dev.productCode,
+            values: r.values,
+          });
         }
       }
     } catch (e) {

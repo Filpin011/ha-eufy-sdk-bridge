@@ -33,7 +33,10 @@ const { cfg, DEBUG, DEBUG_P2P, EVENT_LOG, eventImageDir } = config;
 // last-event thumbnails live in the (mounted) data dir alongside the session file.
 fs.mkdirSync(eventImageDir, { recursive: true });
 if (DEBUG) console.log(`[bridge] BRIDGE_DEBUG on — verbose logging (p2p-firehose ${DEBUG_P2P ? "on" : "off"})`);
-if (EVENT_LOG) console.log('[bridge] event log ON — "[bridge:event]" lines trace each push event + "Last event" image fetch (set BRIDGE_EVENT_LOG=0 to silence)');
+if (EVENT_LOG)
+  console.log(
+    '[bridge] event log ON — "[bridge:event]" lines trace each push event + "Last event" image fetch (set BRIDGE_EVENT_LOG=0 to silence)',
+  );
 if (!cfg.email || !cfg.password) {
   console.error("[bridge] EUFY_EMAIL and EUFY_PASSWORD are required");
   process.exit(1);
@@ -72,8 +75,14 @@ eufy.on("error", (e) => {
 });
 // Push (FCM) liveness — the watchdog's poll heartbeat can't see a dead push channel (events ride push,
 // state rides poll), so track push connect/disconnect explicitly.
-eufy.on("pushConnect", () => { state.flags.pushConnected = true; state.flags.pushSince = Date.now(); });
-eufy.on("pushDisconnect", () => { state.flags.pushConnected = false; state.flags.pushSince = Date.now(); });
+eufy.on("pushConnect", () => {
+  state.flags.pushConnected = true;
+  state.flags.pushSince = Date.now();
+});
+eufy.on("pushDisconnect", () => {
+  state.flags.pushConnected = false;
+  state.flags.pushSince = Date.now();
+});
 
 // ── boot ───────────────────────────────────────────────────────────────────────────────────────────
 async function main() {
@@ -85,7 +94,8 @@ async function main() {
     console.error(`[bridge] login attempt failed: ${e?.message ?? e} — retry via WS 'auth.retrigger'`);
   }
   if (state.flags.ready) console.log("[bridge] logged in from a stored session");
-  else console.log(`[bridge] auth required: ${ctx.authStatus().state} — drive it over WS /ws (auth.status / auth.submit)`);
+  else
+    console.log(`[bridge] auth required: ${ctx.authStatus().state} — drive it over WS /ws (auth.status / auth.submit)`);
 
   // Anker Solix is a separate account on a separate backend, so start it independently of the eufy
   // login above — its outcome never gates eufy devices. No-op unless SOLIX_* is configured.
@@ -106,4 +116,7 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-main().catch((e) => { console.error("[bridge] fatal:", e); process.exit(1); });
+main().catch((e) => {
+  console.error("[bridge] fatal:", e);
+  process.exit(1);
+});

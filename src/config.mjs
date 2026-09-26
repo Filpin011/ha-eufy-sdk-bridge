@@ -5,24 +5,55 @@ import path from "node:path";
 export const SCHEMA_VERSION = 1; // bump on any breaking protocol change so an old frontend fails loudly
 
 const truthy = (v) => /^(1|true|yes|on)$/i.test(String(v ?? ""));
+/** A positive whole number from an env value, else undefined (so the caller's default applies). */
+const positiveInt = (v) => {
+  const n = Number(v);
+  return v != null && v !== "" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
+};
 
 /** The SDK event names broadcast to every connected WS client. */
 export const FORWARDED_EVENTS = [
-  "motion", "personDetected", "strangerDetected", "doorbellPress", "petDetection",
-  "packageDelivered", "packageTaken", "packageStranded", "soundDetected", "cryingDetected",
-  "vehicleDetected", "dogDetected", "armingModeChanged", "alarm", "lockState",
-  "contactState", "batteryLevel", "batteryAlert", "ptzNotify", "smartLightState",
+  "motion",
+  "personDetected",
+  "strangerDetected",
+  "doorbellPress",
+  "petDetection",
+  "packageDelivered",
+  "packageTaken",
+  "packageStranded",
+  "soundDetected",
+  "cryingDetected",
+  "vehicleDetected",
+  "dogDetected",
+  "armingModeChanged",
+  "alarm",
+  "lockState",
+  "contactState",
+  "batteryLevel",
+  "batteryAlert",
+  "ptzNotify",
+  "smartLightState",
 ];
 
 // The "something happened" pushes (not battery/arming/state changes) — these keep a camera's live
 // feed warm and reset the battery rtspStream idle clock (see stream-idle.mjs).
 export const DETECTION_EVENTS = new Set([
-  "motion", "personDetected", "strangerDetected", "petDetection", "vehicleDetected", "dogDetected",
-  "doorbellPress", "packageDelivered", "packageTaken", "packageStranded", "soundDetected", "cryingDetected",
+  "motion",
+  "personDetected",
+  "strangerDetected",
+  "petDetection",
+  "vehicleDetected",
+  "dogDetected",
+  "doorbellPress",
+  "packageDelivered",
+  "packageTaken",
+  "packageStranded",
+  "soundDetected",
+  "cryingDetected",
 ]);
 
-export const PUSH_STALL_MS = 5 * 60_000;   // push down (or never up) this long ⇒ events are dead ⇒ recover
-export const SUSPEND_RELEASE_MS = 30_000;  // no /stream pull this long while suspended ⇒ nobody's watching
+export const PUSH_STALL_MS = 5 * 60_000; // push down (or never up) this long ⇒ events are dead ⇒ recover
+export const SUSPEND_RELEASE_MS = 30_000; // no /stream pull this long while suspended ⇒ nobody's watching
 export const STREAM_FAIL_BACKOFF_MAX_MS = 5 * 60_000; // cap on the exponential backoff after failed opens
 
 /**
@@ -67,6 +98,23 @@ export function loadConfig(env = process.env) {
     // hammering consumer gets a fast 503 instead of a radio wake. Cleared on a successful open or a
     // detection. Default 30s (≈ one ffmpeg retry cycle); 0 disables.
     streamFailBackoffMs: env.STREAM_FAIL_BACKOFF_MS != null ? Number(env.STREAM_FAIL_BACKOFF_MS) : 30_000,
+    // A live snapshot burst wakes a battery camera's radio for EVERY caller — and HA fetches a still per
+    // camera whenever a dashboard renders or the HomeKit tiles refresh. On an account whose pushes carry
+    // no thumbnail, `snapshotStored()` is always empty, so the burst is the only path and every tile costs
+    // a wake (and a ~10-20s stall, past HA's 10s still timeout). Set SNAPSHOT_LIVE=0 to skip the burst and
+    // answer from the retained/persisted thumbnail only. Default on — unchanged behaviour.
+    // "auto" (default): wake the camera for a still only when it is MAINS-POWERED. A mains camera
+    // answers a live burst for free; a battery one pays a radio wake for every fetch, and a host fetches
+    // stills on a timer (HA re-pulls each camera tile), so the cost is continuous. `1` forces the burst
+    // everywhere, `0` never — both remain available for hosts that want the old behaviour.
+    snapshotLive: env.SNAPSHOT_LIVE == null || env.SNAPSHOT_LIVE === "auto" ? "auto" : truthy(env.SNAPSHOT_LIVE),
+    // How long a BATTERY camera may stream continuously, handed to the SDK when /stream opens the session.
+    // The SDK bounds a battery stream to a budget (default 45s) plus a 10s grace, then stops it unless the
+    // caller extends it — and a Readable, which is what /stream consumes, has no way to extend. So every
+    // watched battery stream ended after ~55s, and the consumer's reconnect woke the camera again. Unset
+    // keeps the SDK default. Mains cameras ignore it, and closing the last viewer still ends the session
+    // at once. Positive whole ms; anything else → default.
+    streamBatteryBudgetMs: positiveInt(env.STREAM_BATTERY_BUDGET_MS),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

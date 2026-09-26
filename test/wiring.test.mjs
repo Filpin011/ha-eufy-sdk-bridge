@@ -32,27 +32,77 @@ function fakeEufy() {
       save: async (id) => void ptzCalls.push(["preset.save", id]),
     }),
   };
+  // Mirrors the SDK's `siren` surface on a verified alarm-output device: `trigger(seconds)` and
+  // `stop()`. Both ANSWER nothing — they are fire-and-forget dispatches — so the fake records what it
+  // was asked to do, which is what the `device.action` routing test asserts on.
+  const sirenCalls = [];
+  const sirenSurface = {
+    trigger: async (seconds) => void sirenCalls.push(["trigger", seconds]),
+    stop: async () => void sirenCalls.push(["stop"]),
+  };
   const devices = {
     CAM1: {
-      describe: () => ({ sn: "CAM1", name: "Cam", model: "T8410", modelName: "Indoor", codec: "camera", capabilities: ["camera", "video", "battery"] }),
+      describe: () => ({
+        sn: "CAM1",
+        name: "Cam",
+        model: "T8410",
+        modelName: "Indoor",
+        codec: "camera",
+        capabilities: ["camera", "video", "battery"],
+      }),
       getProperties: () => ({ battery: { value: 74 }, motion: { value: false } }),
     },
     PTCAM1: {
-      describe: () => ({ sn: "PTCAM1", name: "Pan cam", model: "T8425", modelName: "Indoor Cam Pan & Tilt", codec: "camera", capabilities: ["camera", "video", "ptz"] }),
+      describe: () => ({
+        sn: "PTCAM1",
+        name: "Pan cam",
+        model: "T8410",
+        modelName: "Indoor Cam Pan & Tilt",
+        codec: "camera",
+        capabilities: ["camera", "video", "ptz"],
+      }),
       getProperties: () => ({ battery: { value: 50 } }),
       ptz: () => ptzSurface,
     },
+    SIRENCAM1: {
+      describe: () => ({
+        sn: "SIRENCAM1",
+        name: "Siren cam",
+        model: "T8114",
+        modelName: "eufyCam",
+        codec: "camera",
+        capabilities: ["camera", "video", "siren"],
+      }),
+      getProperties: () => ({ battery: { value: 61 } }),
+      siren: () => sirenSurface,
+    },
     SENSOR1: {
-      describe: () => ({ sn: "SENSOR1", name: "Sensor", model: "T8900", modelName: "Entry", codec: "sensor", capabilities: ["contact", "battery"] }),
+      describe: () => ({
+        sn: "SENSOR1",
+        name: "Sensor",
+        model: "T8900",
+        modelName: "Entry",
+        codec: "sensor",
+        capabilities: ["contact", "battery"],
+      }),
       getProperties: () => ({ contact: { value: true } }),
     },
   };
   return {
     ptzCalls, // what the fake ptz surface was asked to do, for the device.action test
+    sirenCalls, // what the fake siren surface was asked to do, for the device.action test
     pollIntervalMs: 600000,
-    async getDevices() { return [{ sn: "CAM1" }, { sn: "PTCAM1" }, { sn: "SENSOR1" }]; },
-    async getDevice(sn) { const d = devices[sn]; if (!d) throw new Error(`no device ${sn}`); return d; },
-    setPollInterval(ms) { this.pollIntervalMs = ms; },
+    async getDevices() {
+      return [{ sn: "CAM1" }, { sn: "PTCAM1" }, { sn: "SIRENCAM1" }, { sn: "SENSOR1" }];
+    },
+    async getDevice(sn) {
+      const d = devices[sn];
+      if (!d) throw new Error(`no device ${sn}`);
+      return d;
+    },
+    setPollInterval(ms) {
+      this.pollIntervalMs = ms;
+    },
     on() {}, // event wiring is a no-op in the smoke harness (completeBoot isn't run)
   };
 }
@@ -65,8 +115,13 @@ function buildCtx() {
   const ctx = { ...config, eufy, state };
   Object.assign(
     ctx,
-    createFaces(ctx), createDeviceView(ctx), createWarmup(ctx), createStreamIdle(ctx),
-    createWatchdog(ctx), createAuth(ctx), createBoot(ctx),
+    createFaces(ctx),
+    createDeviceView(ctx),
+    createWarmup(ctx),
+    createStreamIdle(ctx),
+    createWatchdog(ctx),
+    createAuth(ctx),
+    createBoot(ctx),
   );
   const httpServer = http.createServer(createHttpHandler(ctx));
   Object.assign(ctx, createWsServer(ctx, httpServer)); // attaches to httpServer without listening
@@ -86,7 +141,7 @@ test("device view: describe shape + camera vs sensor", async () => {
   const list = await ctx.deviceList();
   const cam = list.find((d) => d.sn === "CAM1");
   const sensor = list.find((d) => d.sn === "SENSOR1");
-  assert.equal(list.length, 3);
+  assert.equal(list.length, 4); // CAM1, PTCAM1, SIRENCAM1, SENSOR1
   assert.equal(cam.stream, "/stream/CAM1");
   assert.equal(cam.streaming, false); // nothing piping
   assert.equal(cam.canReboot, false);
@@ -107,7 +162,11 @@ test("auth state machine: pending → ok → reauth", () => {
 test("ws: auth.status, unknown cmd, and the auth gate", async () => {
   const { ctx, state, httpServer } = buildCtx();
 
-  assert.deepEqual((await wsCall(ctx, { id: 1, cmd: "auth.status" }))[0], { id: 1, ok: true, auth: { state: "pending" } });
+  assert.deepEqual((await wsCall(ctx, { id: 1, cmd: "auth.status" }))[0], {
+    id: 1,
+    ok: true,
+    auth: { state: "pending" },
+  });
 
   const unknown = await wsCall(ctx, { id: 2, cmd: "nope" });
   assert.equal(unknown[0].ok, false);
@@ -122,8 +181,31 @@ test("ws: auth.status, unknown cmd, and the auth gate", async () => {
   state.flags.ready = true;
   const listed = await wsCall(ctx, { id: 4, cmd: "devices.list" });
   assert.equal(listed[0].ok, true);
-  assert.equal(listed[0].devices.length, 3);
+  assert.equal(listed[0].devices.length, 4);
   assert.deepEqual((await wsCall(ctx, { id: 5, cmd: "config.get" }))[0], { id: 5, ok: true, pollMs: 600000 });
+  httpServer.close();
+});
+
+test("device.action: routes siren trigger/stop, and only where the surface exists", async () => {
+  const { ctx, state, httpServer } = buildCtx();
+  state.flags.ready = true;
+
+  const triggered = await wsCall(ctx, { id: 1, cmd: "device.action", sn: "SIRENCAM1", action: "trigger", args: [10] });
+  assert.equal(triggered[0].ok, true);
+
+  const stopped = await wsCall(ctx, { id: 2, cmd: "device.action", sn: "SIRENCAM1", action: "stop" });
+  assert.equal(stopped[0].ok, true);
+
+  // The positional args reach the surface unchanged — a duration the SDK validates, not a clamp here.
+  assert.deepEqual(ctx.eufy.sirenCalls, [["trigger", 10], ["stop"]]);
+
+  // A device whose capabilities never installed a siren answers the same way an unknown verb does:
+  // no surface carries the method, so the command fails instead of silently doing nothing.
+  const absent = await wsCall(ctx, { id: 3, cmd: "device.action", sn: "CAM1", action: "trigger", args: [10] });
+  assert.equal(absent[0].ok, false);
+  assert.match(absent[0].error, /no action 'trigger'/);
+  assert.deepEqual(ctx.eufy.sirenCalls, [["trigger", 10], ["stop"]]); // unchanged
+
   httpServer.close();
 });
 
@@ -132,7 +214,12 @@ test("http: /healthz reports ok + auth + empty streaming", async () => {
   const handler = createHttpHandler(ctx);
   const req = { url: "/healthz", headers: { host: "localhost" }, on() {} };
   let body;
-  const res = { writeHead() {}, end(s) { body = s; } };
+  const res = {
+    writeHead() {},
+    end(s) {
+      body = s;
+    },
+  };
   await handler(req, res);
   const out = JSON.parse(body);
   assert.equal(out.ok, true);

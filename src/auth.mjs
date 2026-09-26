@@ -65,7 +65,8 @@ export function createAuth(ctx) {
     try {
       await eufy.disconnect().catch(() => {});
       await applyLogin(await eufy.login()); // Ok → clears sessionLost + re-arms; else → surfaces require_2fa
-      if (flags.sessionLost) console.error(`[bridge] re-login needs user action (${flags.lastLogin?.status}) — drive auth.submit`);
+      if (flags.sessionLost)
+        console.error(`[bridge] re-login needs user action (${flags.lastLogin?.status}) — drive auth.submit`);
       else console.log("[bridge] cloud session re-established after expiry");
     } catch (err) {
       ctx.broadcast({ event: "auth", ...authStatus() });

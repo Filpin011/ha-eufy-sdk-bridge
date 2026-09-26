@@ -27,9 +27,7 @@ export function createWatchdog(ctx) {
     const pushStalled = pushDeadMs >= PUSH_STALL_MS;
     if (!pollStalled && !pushStalled) return;
     flags.recovering = true;
-    const why = pollStalled
-      ? `poll idle ${Math.round(idleMs / 1000)}s`
-      : `push down ${Math.round(pushDeadMs / 1000)}s`;
+    const why = pollStalled ? `poll idle ${Math.round(idleMs / 1000)}s` : `push down ${Math.round(pushDeadMs / 1000)}s`;
     console.error(`[bridge] realtime stalled (${why}) — re-establishing`);
     try {
       await eufy.disconnect();

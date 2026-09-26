@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # Build and push the bridge image as a MULTI-ARCH manifest to GitHub Container Registry.
 #
-# Why this exists: the add-on (ha-eufy-sdk-addon) builds FROM this image on aarch64 / armv7 / amd64
-# (Home Assistant OS runs on Raspberry Pi as often as on x86), so a single-arch `docker build … && push`
-# leaves ARM installs unable to resolve the base. `docker buildx --platform …` produces one manifest
-# that carries all three; the Dockerfile already selects the go2rtc binary by TARGETARCH, so no
-# per-arch edits are needed here.
+# Why this exists: the add-on (ha-eufy-sdk-addon) builds FROM this image on aarch64 / amd64, so a
+# single-arch `docker build … && push` leaves ARM installs unable to resolve the base. `docker buildx
+# --platform …` produces one manifest carrying both; the Dockerfile selects the go2rtc binary by
+# TARGETARCH, so no per-arch edits are needed here. (node:24-alpine has no arm/v7 base, so 32-bit ARM
+# is not built.)
 #
 # Prerequisites:
 #   - Docker with buildx (Docker 20.10+).
 #   - Logged in to ghcr.io:  echo "$GHCR_PAT" | docker login ghcr.io -u <user> --password-stdin
 #     (the PAT needs `write:packages`.)
-#   - The SDK sibling checkout at ../eufy-sdk (supplied as the `sdk` named build context — the bridge
-#     depends on it as file:../eufy-sdk, which does not resolve inside the build otherwise).
+# The SDK is a public npm package pulled by `npm ci` inside the build — no sibling checkout / context.
 #
 # Usage:
 #   scripts/publish-multiarch.sh              # version from package.json, tags :<version> + :latest
@@ -23,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE="ghcr.io/mega-yfue/ha-eufy-sdk-bridge"
-PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64,linux/arm/v7}"
+PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 VERSION="${1:-$(node -p "require('./package.json').version")}"
 
 # The SDK is a public npm package (@mega-yfue/eufy-sdk, pinned in package.json), pulled by `npm ci`

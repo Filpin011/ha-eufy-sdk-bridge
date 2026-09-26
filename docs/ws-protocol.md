@@ -34,6 +34,7 @@ sends and receives.
 ## Commands
 
 ### `auth.status`
+
 Ask what the login needs right now.
 
 ```jsonc
@@ -45,13 +46,13 @@ Ask what the login needs right now.
 
 `auth` is one of:
 
-| state | extra fields | meaning |
-| --- | --- | --- |
-| `ok` | — | logged in; device commands work |
-| `require_2fa` | `method` | a 2FA code was sent; submit it |
-| `require_captcha` | `image` (`data:image/png;base64,…`), `retry` (bool) | solve the captcha image |
-| `pending` | — | no challenge yet / retrying |
-| `reauth` | — | the cloud session was kicked/expired **after** startup (another login on the account, or a token timeout); the bridge is re-logging in automatically. It becomes `ok` on success, or `require_2fa` if a fresh code is needed — drive `auth.submit` then |
+| state             | extra fields                                        | meaning                                                                                                                                                                                                                                                 |
+| ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ok`              | —                                                   | logged in; device commands work                                                                                                                                                                                                                         |
+| `require_2fa`     | `method`                                            | a 2FA code was sent; submit it                                                                                                                                                                                                                          |
+| `require_captcha` | `image` (`data:image/png;base64,…`), `retry` (bool) | solve the captcha image                                                                                                                                                                                                                                 |
+| `pending`         | —                                                   | no challenge yet / retrying                                                                                                                                                                                                                             |
+| `reauth`          | —                                                   | the cloud session was kicked/expired **after** startup (another login on the account, or a token timeout); the bridge is re-logging in automatically. It becomes `ok` on success, or `require_2fa` if a fresh code is needed — drive `auth.submit` then |
 
 The bridge pushes an unsolicited `auth` event (same fields as `auth.status`'s `auth` object) whenever this
 state changes, so a frontend re-renders the challenge without polling. A single active session per account
@@ -59,6 +60,7 @@ means a login elsewhere (e.g. opening the phone app) bumps the bridge into `reau
 unless the account then demands a 2FA code.
 
 ### `auth.submit`
+
 Submit a 2FA code **or** a captcha answer. The pending id/token is held inside the bridge.
 
 ```jsonc
@@ -73,6 +75,7 @@ Submit a 2FA code **or** a captcha answer. The pending id/token is held inside t
 ```
 
 ### `auth.retrigger`
+
 Request a fresh challenge (new captcha image / new 2FA code).
 
 ```jsonc
@@ -83,7 +86,8 @@ Request a fresh challenge (new captcha image / new 2FA code).
 ```
 
 ### `devices.list`
-Every device the account exposes. *(Requires `auth.state == "ok"`.)*
+
+Every device the account exposes. _(Requires `auth.state == "ok"`.)_
 
 ```jsonc
 // →
@@ -120,7 +124,8 @@ Every device the account exposes. *(Requires `auth.state == "ok"`.)*
 - A device that failed to resolve appears as `{ "sn": "…", "error": "…" }`.
 
 ### `device.state`
-The same shape as one `devices.list` entry, for a single device (identity + capabilities + live `state`). *(Requires auth.)*
+
+The same shape as one `devices.list` entry, for a single device (identity + capabilities + live `state`). _(Requires auth.)_
 
 ```jsonc
 // →
@@ -130,9 +135,10 @@ The same shape as one `devices.list` entry, for a single device (identity + capa
 ```
 
 ### `device.properties`
+
 The device's **property manifest** — one entry per property, with enough metadata for a frontend to
 build the right entity without knowing eufy wire ids. Static per device; fetch once at setup.
-*(Requires auth.)*
+_(Requires auth.)_
 
 ```jsonc
 // →
@@ -155,8 +161,9 @@ Map an entry to an entity: `writable` + `bool` → **switch**, `enum` → **sele
 from `state` (same `name`).
 
 ### `device.set`
+
 Write a property (maps to the SDK's `setProperty`). The valid `name`s are the writable properties a
-device's capabilities expose (e.g. `statusLed`, `nightVision`, guard-mode `mode`, …). *(Requires auth.)*
+device's capabilities expose (e.g. `statusLed`, `nightVision`, guard-mode `mode`, …). _(Requires auth.)_
 
 ```jsonc
 // →
@@ -168,10 +175,11 @@ device's capabilities expose (e.g. `statusLed`, `nightVision`, guard-mode `mode`
 ```
 
 ### `device.action`
-Invoke a capability **action** — a typed method that isn't a scalar writable property, so `device.set`
-can't reach it. `args` is the positional argument list (omitted = none). Only methods the SDK's own
-capability surfaces expose are reachable; today those are `smart_light`, `camera` and `ptz`.
-*(Requires auth.)*
+
+Invoke a capability **action** — a typed method that is not a scalar property, so `device.set` cannot
+reach it. `{ sn, action, args? }`, where `args` is the positional argument list. Only methods a
+capability surface exposes are reachable; today those surfaces are `smart_light`, `camera`, `lock`,
+`siren` and `ptz`. _(Requires auth.)_
 
 A **dotted** `action` walks a sub-API namespace: every segment before the last one hands back a
 namespace without acting (so it takes no arguments), and only the final segment receives `args`.
@@ -182,27 +190,33 @@ namespace without acting (so it takes no arguments), and only the final segment 
 { "id": 7, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "left" }
 // ←
 { "id": 7, "ok": true, "result": null }
-
 // move to stored preset 3 →
 { "id": 8, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "preset.goto", "args": [3] }
-// save the camera's current position into preset 3 →
-{ "id": 9, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "preset.save", "args": [3] }
-
-// a verb no surface carries →
-{ "id": 10, "ok": false, "error": "no action 'calibrate' on EXAMPLE-CAM-0001" }
+// sound the alarm for 10 s — a HomeBase, or a camera attached to one →
+{ "id": 9, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "trigger", "args": [10] }
+// stop it before the duration runs out →
+{ "id": 10, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "stop" }
+// no surface on this device carries the verb →
+{ "id": 11, "ok": false, "error": "no action 'calibrate' on EXAMPLE-CAM-0002" }
 ```
 
 PTZ movement is **fire-and-forget**: P2P sends no acknowledgement, so `ok: true` means the frame left
 for the camera, not that it finished moving. Where the camera ended up arrives separately as a
 `ptzNotify` event. The preset write verbs are fire-and-forget the same way, and referencing an **empty
 slot is a silent no-op** — `goto`/`save`/`delete` on an unpopulated id do nothing and report no error.
-Only cameras whose `capabilities` include `ptz` carry these verbs; asking a fixed camera fails with
-`no action`.
+Only cameras whose `capabilities` include `ptz` carry these verbs.
+
+The siren verbs install only where the SDK has evidence for a wire: a HomeBase reporting hub-alarm
+params, a camera attached to one that reports the EAS slot, or a standalone siren (`stop` only, plus
+its own `test`). A device that has them lists `"siren"` among its `devices.list` capabilities — the
+duration is validated by the SDK, which rejects anything that is not a positive whole number of
+seconds.
 
 ### `device.reboot`
+
 Reboot a **HomeBase / station** (maps to the SDK's `reboot`). Only devices with `canReboot: true` accept
 it; the SDK throws for a non-hub serial. The hub drops offline for a minute or two, then rejoins.
-*(Requires auth.)*
+_(Requires auth.)_
 
 ```jsonc
 // →
@@ -214,10 +228,11 @@ it; the SDK throws for a non-hub serial. The hub drops offline for a minute or t
 ```
 
 ### `event.refresh`
+
 Force an immediate **"Last event" image** refresh for a device — pull the newest event cover from the
 HomeBase now and (if a genuinely newer image landed) broadcast `eventImageUpdated`. Backs a manual
 "Refresh Last Event" control; useful when the automatic on-detection refresh raced the HomeBase writing
-the crop. *(Requires auth.)*
+the crop. _(Requires auth.)_
 
 ```jsonc
 // →  { "id": 8, "cmd": "event.refresh", "sn": "EXAMPLE-CAM-0001" }
@@ -225,9 +240,10 @@ the crop. *(Requires auth.)*
 ```
 
 ### `config.get` / `config.set`
+
 Read or change the **cloud poll interval** (`pollMs`, milliseconds) at runtime — how often the bridge
 re-reads device state from the cloud. `0` disables polling. Unset at startup → the SDK default
-(600000 = 10 min); the `EUFY_POLL_MS` env var sets the startup value. *(Requires auth.)*
+(600000 = 10 min); the `EUFY_POLL_MS` env var sets the startup value. _(Requires auth.)_
 
 ```jsonc
 // →  { "id": 9, "cmd": "config.get" }
@@ -243,8 +259,9 @@ Faster polling means fresher state but more cloud traffic; the cloud itself only
 values on the order of minutes, so intervals below ~1 min mostly add load without adding freshness.
 
 ### `stream.start`
+
 Returns the URLs for a camera's live video. **Does not open the camera** — connecting to the URL is
-what starts it; disconnecting stops it. *(Requires auth.)*
+what starts it; disconnecting stops it. _(Requires auth.)_
 
 ```jsonc
 // →
@@ -259,7 +276,8 @@ what starts it; disconnecting stops it. *(Requires auth.)*
 ```
 
 ### `stream.stop`
-Advisory only — the media connection closing is the real "stop". *(Requires auth.)*
+
+Advisory only — the media connection closing is the real "stop". _(Requires auth.)_
 
 ```jsonc
 // →  { "id": 8, "cmd": "stream.stop", "sn": "…" }
@@ -267,19 +285,24 @@ Advisory only — the media connection closing is the real "stop". *(Requires au
 ```
 
 ### Anker Solix (`solix.*`)
+
 Optional — present only when the bridge has `SOLIX_EMAIL` / `SOLIX_PASSWORD` set. Solix is a **separate
 Anker account** on a separate backend, so these commands do **not** require the eufy `auth.state == "ok"`
 and are independent of the eufy device commands above.
 
 #### `solix.status`
+
 ```jsonc
 // →  { "id": 9, "cmd": "solix.status" }
 // ←  { "id": 9, "ok": true, "solix": { "enabled": true, "state": "ready", "deviceCount": 1 } }
 ```
+
 `state`: `disabled` | `connecting` | `2fa` | `ready` | `error`. `enabled` is `false` when `SOLIX_*` is unset.
 
 #### `solix.devices`
-The account's Solix devices (empty until `state == "ready"`). *(Not gated by eufy auth.)*
+
+The account's Solix devices (empty until `state == "ready"`). _(Not gated by eufy auth.)_
+
 ```jsonc
 // →  { "id": 10, "cmd": "solix.devices" }
 // ←  { "id": 10, "ok": true, "devices": [ {
@@ -291,13 +314,16 @@ The account's Solix devices (empty until `state == "ready"`). *(Not gated by euf
 ```
 
 #### `solix.submitCode`
+
 Complete a pending Solix 2FA (only when `state == "2fa"`). The code is never logged.
+
 ```jsonc
 // →  { "id": 11, "cmd": "solix.submitCode", "code": "123456" }
 // ←  { "id": 11, "ok": true, "solix": { "enabled": true, "state": "ready", "deviceCount": 1 } }
 ```
 
 ### Errors
+
 - Unknown command → `{ "id": n, "ok": false, "error": "unknown cmd: …" }`
 - A device command before auth → `{ "id": n, "ok": false, "error": "not authenticated — query auth.status and complete 2FA/captcha first" }`
 - Malformed frame → `{ "ok": false, "error": "bad json" }` (no `id`)
@@ -307,11 +333,12 @@ Complete a pending Solix 2FA (only when `state == "2fa"`). The code is never log
 ## Events (unsolicited)
 
 ### Lifecycle
-| event | payload | when |
-| --- | --- | --- |
-| `hello` | `{ schemaVersion, auth: { state, … } }` | on connect |
-| `auth` | `{ state, image?, method?, retry? }` | auth state changed |
-| `ready` | `{ schemaVersion }` | login complete + devices/go2rtc up |
+
+| event   | payload                                 | when                               |
+| ------- | --------------------------------------- | ---------------------------------- |
+| `hello` | `{ schemaVersion, auth: { state, … } }` | on connect                         |
+| `auth`  | `{ state, image?, method?, retry? }`    | auth state changed                 |
+| `ready` | `{ schemaVersion }`                     | login complete + devices/go2rtc up |
 
 ```json
 { "event": "hello", "schemaVersion": 1, "auth": { "state": "ok" } }
@@ -320,6 +347,7 @@ Complete a pending Solix 2FA (only when `state == "2fa"`). The code is never log
 ```
 
 ### Device events (forwarded from the SDK, broadcast to all clients)
+
 Each carries the SDK's event payload (typically `deviceSn` / `stationSn` plus event-specific fields).
 
 ```json
@@ -335,13 +363,14 @@ Full set: `motion`, `personDetected`, `strangerDetected`, `doorbellPress`, `petD
 `batteryLevel`, `batteryAlert`, `ptzNotify`, `smartLightState`.
 
 ### Anker Solix events
+
 Present only when Solix is configured (`SOLIX_*`).
 
-| event | payload | when |
-| --- | --- | --- |
-| `solixAuth` | `{ state, method?, error? }` | Solix login state changed (incl. `state: "2fa"`) |
-| `solixReady` | `{ devices: [...] }` | Solix devices discovered (same shape as `solix.devices`) |
-| `solixReading` | `{ deviceSn, productCode, values }` | a live telemetry frame |
+| event          | payload                             | when                                                     |
+| -------------- | ----------------------------------- | -------------------------------------------------------- |
+| `solixAuth`    | `{ state, method?, error? }`        | Solix login state changed (incl. `state: "2fa"`)         |
+| `solixReady`   | `{ devices: [...] }`                | Solix devices discovered (same shape as `solix.devices`) |
+| `solixReading` | `{ deviceSn, productCode, values }` | a live telemetry frame                                   |
 
 ```json
 { "event": "solixReading", "deviceSn": "…", "productCode": "AE1X0", "values": { "gridVoltage": 237.1 } }
@@ -360,11 +389,11 @@ Fired when a camera's live P2P feed opens (`active: true`) or is torn down / idl
 
 ## Sibling HTTP endpoints
 
-| method + path | returns |
-| --- | --- |
-| `GET /healthz` | `{ ok, schemaVersion, auth: { state }, streaming: [sn,…] }` — always available (even before auth) |
-| `GET /snapshot/<sn>` | a JPEG still (`image/jpeg`). *Requires auth.* |
-| `GET /stream/<sn>` | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. *Requires auth.* |
+| method + path        | returns                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------- |
+| `GET /healthz`       | `{ ok, schemaVersion, auth: { state }, streaming: [sn,…] }` — always available (even before auth) |
+| `GET /snapshot/<sn>` | a JPEG still (`image/jpeg`). _Requires auth._                                                     |
+| `GET /stream/<sn>`   | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. _Requires auth._                     |
 
 go2rtc (bundled) turns `/stream/<sn>` into RTSP / WebRTC / MSE / HLS, so the frontend never speaks the
 raw video protocol.
@@ -372,8 +401,8 @@ raw video protocol.
 ---
 
 ## Not yet exposed
-- Capability **action** verbs beyond the `smart_light` / `camera` / `ptz` surfaces `device.action`
-  routes today (e.g. siren test, talkback).
+
+- Capability **action** verbs beyond the surfaces `device.action` routes today (e.g. talkback).
 - PTZ **zoom** (`zoom`) and the preset **read** verbs (`preset.list` / `preset.image`): both exist on
   the SDK surface and `device.action` would route them, but zoom needs a second telephoto lens and the
   read verbs answer over P2P request/reply, so neither is exercised here yet.
