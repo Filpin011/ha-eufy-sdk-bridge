@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.36";
+const PROBE_BUILD = "probe.37";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -75,6 +75,7 @@ export function createBoot(ctx) {
       await analyse(saved);
       await inspectCipher();
       await tryOlderCipherApi(lastClip?.accountId, lastClip?.stationSn);
+      await tryImageKey();
       await tryNodeRsa();
       await legacyCipher(lastClip?.stationSn);
       await tryUnwrap(saved);
@@ -795,6 +796,107 @@ export function createBoot(ctx) {
    *
    * Runs on the saved clip and the getCiphers call we already make. No camera, no second login.
    */
+  /**
+   * THE answer, from peakwellnv/eufy-bridge: a standalone cipher-0 camera does NOT use the cloud RSA
+   * key. On CMD_DOWNLOAD_VIDEO the camera ACKs with a 10-digit code, and the AES-128 key is
+   * getImageKey(serial, p2p_did, code) — the same derivation the SDK already uses for thumbnails, and
+   * the same algorithm the USENIX paper documents. Only the first 128 bytes of each keyframe are
+   * AES-128-ECB encrypted; the rest is plain.
+   *
+   * The RSA reading was wrong: 22..150 is not a wrapped key, it is the encrypted opening of the frame.
+   *
+   * This tests it entirely offline. The saved clip is 20260925142939; its code — seen both in the
+   * download ACK and in the snapshot prefix `eufysecurity:...:0191634706` — is 0191634706. Serial is
+   * known; p2p_did comes from the device list already in session. No camera, no login.
+   */
+  function idSuffix(did) {
+    const m = String(did).match(/^[A-Z]+-(\d+)-[A-Z]+$/);
+    if (!m) return 0;
+    const d = m[1];
+    const n1 = +d[0], n2 = +d[1], n3 = +d[3], n4 = +d[5];
+    let r = n1 + n2 + n3;
+    if (n3 < 5) r += n3;
+    return r + n4;
+  }
+  function imageBaseCode(serial, did) {
+    let nr = parseInt(`0x${serial[serial.length - 1]}`);
+    nr = (nr + 10) % 10;
+    return serial.substring(nr) + idSuffix(did);
+  }
+  function imageSeed(did, code) {
+    const nCode = parseInt(String(code).substring(2));
+    const prefix = 1000 - idSuffix(did);
+    return crypto.createHash("md5").update(`${prefix}${nCode}`).digest("hex").toUpperCase();
+  }
+  function imageKeyHex(serial, did, code) {
+    const baseCode = imageBaseCode(serial, did);
+    const seed = imageSeed(did, code);
+    const h = [...crypto.createHash("sha256").update(`01${baseCode}${seed}`).digest()];
+    const startByte = h[10];
+    for (let i = 0; i < 32; i++) {
+      const byte = h[i];
+      let fixed = startByte;
+      if (i < 31) fixed = h[i + 1];
+      if (i === 31 || (i & 1) !== 0) {
+        h[10] = fixed;
+        if (byte > 126 || h[10] > 126) {
+          if (byte < h[10] || byte - h[10] === 0) h[i] = h[10] - byte;
+          else h[i] = byte - h[10];
+        }
+      } else if (byte < 125 || fixed < 125) {
+        h[i] = fixed + byte;
+      }
+    }
+    return Buffer.from(h.slice(16)).toString("hex").toUpperCase();
+  }
+
+  async function tryImageKey() {
+    const serial = lastClip?.stationSn || "T8171T1025250770";
+    const code = process.env.PROBE_CODE || "0191634706";
+    let did;
+    try {
+      const devs = await eufy.getDevices();
+      const d = devs.find((x) => x?.sn === serial) ?? devs[0];
+      did = d?.raw?.p2p_did;
+    } catch (e) {
+      return console.log(`[img] getDevices failed: ${e?.message ?? e}`);
+    }
+    console.log(`[img] serial=${serial} did=${did ?? "MISSING"} code=${code}`);
+    if (!did) return console.log("[img] no p2p_did on the device");
+
+    let kf;
+    try {
+      const saved = await fsp.readFile(SAVED);
+      for (let i = 0; i + 16 <= saved.length; ) {
+        if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+        const len = saved.readUInt32LE(i + 6);
+        if (saved[i + 13] === 1 && !kf) kf = saved.subarray(i + 16, i + 16 + len);
+        i += 16 + len;
+      }
+    } catch (e) {
+      return console.log(`[img] no saved clip: ${e?.message}`);
+    }
+    if (!kf) return console.log("[img] no keyframe in the saved clip");
+
+    const hex = imageKeyHex(serial, did, code);
+    const key = Buffer.from(hex, "ascii").subarray(0, 16); // first 16 ASCII chars of the hex, as peakwellnv does
+    console.log(`[img] key hex=${hex}  aes(ascii16)=${key.toString("hex")}`);
+
+    // Encrypted region: 128 bytes right after the 22-byte inner header.
+    const enc = kf.subarray(22, 22 + 128);
+    try {
+      const d = crypto.createDecipheriv("aes-128-ecb", key, null);
+      d.setAutoPadding(false);
+      const dec = Buffer.concat([d.update(enc), d.final()]);
+      const ok = dec[0] === 0 && dec[1] === 0 && dec[2] === 0 && (dec[3] === 1 || (dec[2] === 1));
+      console.log(`[img] decrypted head: ${dec.subarray(0, 16).toString("hex")}`);
+      const sc = dec[0] === 0 && dec[1] === 0 && dec[2] === 0 && dec[3] === 1;
+      console.log(sc ? `[img] *** START CODE, nal ${dec[4] & 0x1f} — THE CLIP IS OPEN ***` : "[img] no start code with this code — a fresh ACK code may be needed");
+    } catch (e) {
+      console.log(`[img] decrypt threw: ${e?.message}`);
+    }
+  }
+
   async function tryNodeRsa() {
     let NodeRSA;
     try {
