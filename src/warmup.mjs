@@ -492,6 +492,7 @@ export function createWarmup(ctx) {
   }
 
   return {
+    withDbLock,
     warmFaceRoster,
     warmLastEventImages,
     refreshLastEventImageFor,

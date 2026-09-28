@@ -271,6 +271,36 @@ export function createHttpHandler(ctx) {
       }
     }
 
+    // A recording's event snapshot (the grid thumbnail). Cheap: one requestImage over P2P, no download.
+    //   GET /recording-thumb/<sn>?path=<thumb_path>
+    if (kind === "recording-thumb" && sn && ctx.fetchThumb) {
+      const thumbPath = url.searchParams.get("path");
+      try {
+        const jpeg = await ctx.fetchThumb(sn, thumbPath);
+        if (!jpeg) return json(res, 404, { error: "no thumbnail" });
+        res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length, "cache-control": "max-age=86400" });
+        return res.end(jpeg);
+      } catch (e) {
+        return json(res, 502, { error: String(e?.message ?? e) });
+      }
+    }
+
+    // One saved recording, downloaded from the SD card, decrypted and muxed to MP4 on the fly.
+    //   GET /recording/<sn>?path=<storage_path>
+    // The heavy path (wakes the camera): only hit when a clip is actually opened.
+    if (kind === "recording" && sn && ctx.downloadRecording) {
+      const storagePath = url.searchParams.get("path");
+      const ac = new AbortController();
+      req.on("close", () => ac.abort());
+      try {
+        const mp4 = await ctx.downloadRecording(sn, storagePath, { signal: ac.signal });
+        res.writeHead(200, { "content-type": "video/mp4", "content-length": mp4.length, "cache-control": "no-store" });
+        return res.end(mp4);
+      } catch (e) {
+        return json(res, 502, { error: String(e?.message ?? e) });
+      }
+    }
+
     return json(res, 404, { error: "not found" });
   };
 }

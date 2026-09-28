@@ -21,6 +21,7 @@ const AUTHED_COMMANDS = new Set([
   "config.set",
   "stream.start",
   "stream.stop",
+  "recording.list",
 ]);
 
 export function createWsServer(ctx, httpServer) {
@@ -181,6 +182,13 @@ export function createWsServer(ctx, httpServer) {
           // HA. Answers { changed } — true when a genuinely newer image landed.
           const changed = ctx.forceRefreshEventImage ? await ctx.forceRefreshEventImage(msg.sn) : false;
           return reply({ changed });
+        }
+        case "recording.list": {
+          // Saved SD-card recordings for one day (YYYYMMDD). Rows carry storage_path + thumb_path; the
+          // frontend fetches thumbnails and the MP4 over HTTP so this stays a small JSON reply.
+          if (!ctx.listRecordings) return fail("recordings not available");
+          const rows = await ctx.listRecordings(String(msg.sn), String(msg.date));
+          return reply({ sn: msg.sn, date: msg.date, recordings: rows });
         }
         case "light.effects": {
           // The smart-light effect gallery (id + display name) for HA's effect_list. Cached; pass

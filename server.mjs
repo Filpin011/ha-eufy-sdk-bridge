@@ -18,6 +18,7 @@ import { createEufy } from "./src/client.mjs";
 import { createFaces } from "./src/faces.mjs";
 import { createDeviceView } from "./src/device-view.mjs";
 import { createWarmup } from "./src/warmup.mjs";
+import { createRecordings } from "./src/recordings.mjs";
 import { createStreamIdle } from "./src/stream-idle.mjs";
 import { createWatchdog } from "./src/watchdog.mjs";
 import { createAuth } from "./src/auth.mjs";
@@ -54,6 +55,7 @@ Object.assign(
   createFaces(ctx),
   createDeviceView(ctx),
   createWarmup(ctx),
+  createRecordings(ctx),
   createStreamIdle(ctx),
   createWatchdog(ctx),
   createAuth(ctx),
