@@ -383,7 +383,12 @@ export function createRecordings(ctx) {
     if (typeof storagePath !== "string" || !storagePath.endsWith(".zxvideo")) throw new Error(`bad recording path: ${storagePath}`);
     return withDbLock(async () => {
       dbg(`recordings.download ${sn} — lock acquired, readying session`);
+      // Take the camera's video channel exclusively: tear down any live stream and block its reopen, since
+      // a standalone camera won't accept a download while it's streaming. Released in the finally below.
+      const held = !!ctx.beginDownloadHold;
+      ctx.beginDownloadHold?.(sn);
       try {
+        if (held) await sleep(1500); // let the stream's P2P session actually close on the camera
         const session = await readySession(sn, signal);
         dbg(`recordings.download ${sn} — session ready, resolving account`);
         const acct = await accountId();
@@ -401,6 +406,8 @@ export function createRecordings(ctx) {
       } catch (e) {
         dbg(`recordings.download ${sn} — FAILED: ${e?.message ?? e}`);
         throw e;
+      } finally {
+        if (held) ctx.endDownloadHold?.(sn); // let go2rtc reopen the live stream
       }
     });
   }

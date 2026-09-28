@@ -227,6 +227,10 @@ export function createHttpHandler(ctx) {
         return json(res, 503, {
           error: "stream idle-suspended — no recent detection, waiting for motion or a fresh viewer",
         });
+      // Download exclusivity: a recording is downloading on this camera, which needs its single video
+      // channel to itself. Serve a fast 503 so go2rtc doesn't reopen the live session mid-transfer.
+      if (ctx.streamSuppressed?.(sn))
+        return json(res, 503, { error: "camera busy downloading a recording — retry shortly" });
       // Failure-backoff: a recent open failed (P2P unreachable), and go2rtc retries every ~30s. Serve a
       // fast 503 without opening a P2P session, so a camera that can't connect isn't woken on every retry.
       const backoff = ctx.streamBackoffMs?.(sn) ?? 0;

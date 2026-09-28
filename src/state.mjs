@@ -36,6 +36,7 @@ export function createState() {
     lastPullAttempt: new Map(), // sn -> ms go2rtc last asked for /stream (even while suspended)
     rtspLastActive: new Map(), // sn -> ms of last detection/stream, for the battery rtspStream auto-off
     streamBackoff: new Map(), // sn -> { until, streak } — fast-503 after a failed open so a hammering consumer can't wake the radio every retry
+    downloadHold: new Set(), // sns whose live stream is held off while a recording downloads (one video op at a time)
 
     // ── optional Anker Solix (separate account/backend; only populated when SOLIX_* is configured) ──
     solix: {

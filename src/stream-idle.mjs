@@ -5,10 +5,29 @@
 // Separately, turn a BATTERY camera's native `rtspStream` publish OFF when it's been idle, since that
 // publishes continuously and flattens the battery even when nobody consumes it.
 
+import { dropStreamClient } from "../streams.mjs";
+
 export function createStreamIdle(ctx) {
   const { cfg, eufy, SUSPEND_RELEASE_MS, STREAM_FAIL_BACKOFF_MAX_MS } = ctx;
   const { flags } = ctx.state;
-  const { lastDetect, activeStreams, idleSuspended, lastPullAttempt, rtspLastActive, streamBackoff } = ctx.state;
+  const { lastDetect, activeStreams, idleSuspended, lastPullAttempt, rtspLastActive, streamBackoff, downloadHold } = ctx.state;
+
+  // ── download exclusivity ──────────────────────────────────────────────────────────────────────────
+  // A standalone camera serves ONE video operation at a time. The live stream runs on its own P2P session
+  // (see streams.mjs); while it's up, the camera ignores a saved-recording download command (no accept
+  // code). So a download holds the camera's video channel: it tears down any live feed + stream client,
+  // and /stream serves a fast 503 until the hold lifts.
+  function streamSuppressed(sn) {
+    return downloadHold.has(sn);
+  }
+  function beginDownloadHold(sn) {
+    downloadHold.add(sn);
+    activeStreams.get(sn)?.feed?.destroy?.(); // stop piping; the feed's cleanup drops it from the maps
+    dropStreamClient(sn); // close the stream client's P2P session so the camera frees the video channel
+  }
+  function endDownloadHold(sn) {
+    downloadHold.delete(sn);
+  }
 
   /** Record a detection and lift any idle-suspension / failure-backoff so the stream may reopen at once. */
   function noteDetection(sn) {
@@ -119,5 +138,15 @@ export function createStreamIdle(ctx) {
     }
   }
 
-  return { noteDetection, streamIdleTick, rtspIdleSweep, streamBackoffMs, noteStreamFailure, noteStreamOpened };
+  return {
+    noteDetection,
+    streamIdleTick,
+    rtspIdleSweep,
+    streamBackoffMs,
+    noteStreamFailure,
+    noteStreamOpened,
+    streamSuppressed,
+    beginDownloadHold,
+    endDownloadHold,
+  };
 }
