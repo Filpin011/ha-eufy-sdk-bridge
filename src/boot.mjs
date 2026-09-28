@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.28";
+const PROBE_BUILD = "probe.29";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -116,7 +116,7 @@ export function createBoot(ctx) {
    * PKCS#1 v1.5 padding, which is random, so the same key wrapped twice shares nothing. Thirty-two
    * bytes is two AES blocks of identical plaintext — which is not what a wrapped key looks like.
    */
-  async function compareFrames(session, saved) {
+  async function compareFrames(session, saved, accountId) {
     const live = [];
     const onData = (f) => {
       if (f?.commandName === "CMD_VIDEO_FRAME" && f.data?.length > 8000) live.push(Buffer.from(f.data));
@@ -127,8 +127,10 @@ export function createBoot(ctx) {
     // envelope, read from startLiveJson and sent raw — so use exactly that, unchanged.
     console.log("[cmp] starting live to catch a keyframe…");
     try {
-      const env = JSON.parse(String(session.startLiveJson(0, lastClip?.accountId ?? "")));
-      session.sendSetPayload(1000, {}, { rawValue: env, wrapCmd: 1700, channel: 0, accountId: lastClip?.accountId });
+      if (!accountId) return console.log("[cmp] no account id — the envelope would go out malformed");
+      const env = JSON.parse(String(session.startLiveJson(0, accountId)));
+      console.log(`[cmp] envelope account_id: ${env.data?.account_id ? "set" : "MISSING"}`);
+      session.sendSetPayload(1000, {}, { rawValue: env, wrapCmd: 1700, channel: 0, accountId });
     } catch (e) {
       console.log(`[cmp] start threw: ${e?.message}`);
     }
@@ -712,7 +714,7 @@ export function createBoot(ctx) {
     // plain live start. So compare the two keyframes instead of guessing at a third envelope.
     try {
       const savedBytes = await fsp.readFile(SAVED);
-      await compareFrames(session, savedBytes);
+      await compareFrames(session, savedBytes, accountId);
     } catch (e) {
       console.log(`[cmp] no saved clip to compare against: ${e?.message}`);
     }
