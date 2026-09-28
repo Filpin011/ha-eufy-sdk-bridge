@@ -319,18 +319,25 @@ export function createRecordings(ctx) {
 
   /** Download one recording and return a decoded, muxed MP4 Buffer. */
   async function downloadRecording(sn, storagePath, { signal } = {}) {
-    if (typeof storagePath !== "string" || !storagePath.endsWith(".zxvideo")) throw new Error("bad recording path");
+    dbg(`recordings.download ${sn} — requested ${storagePath}`);
+    if (typeof storagePath !== "string" || !storagePath.endsWith(".zxvideo")) throw new Error(`bad recording path: ${storagePath}`);
     return withDbLock(async () => {
-      const session = await readySession(sn, signal);
-      const acct = await accountId();
-      const did = await p2pDidOf(sn);
-      const { frames, key } = await runDownload(session, storagePath, acct, sn, did, signal);
-      if (!key) throw new Error("no key material from the download");
-      if (!frames.length) throw new Error("download produced no frames");
+      try {
+        const session = await readySession(sn, signal);
+        const acct = await accountId();
+        const did = await p2pDidOf(sn);
+        const { frames, key } = await runDownload(session, storagePath, acct, sn, did, signal);
+        if (!key) throw new Error("no key material from the download");
+        if (!frames.length) throw new Error("download produced no frames");
 
-      const stream = decodeRecordFrames(frames, key);
-      dbg(`recordings.download ${sn} → ${frames.length} frames, ${stream.length}B annexb`);
-      return muxToMp4(stream);
+        const stream = decodeRecordFrames(frames, key);
+        const mp4 = await muxToMp4(stream);
+        dbg(`recordings.download ${sn} → ${frames.length} frames, ${stream.length}B annexb → ${mp4.length}B mp4`);
+        return mp4;
+      } catch (e) {
+        dbg(`recordings.download ${sn} — FAILED: ${e?.message ?? e}`);
+        throw e;
+      }
     });
   }
 

@@ -281,6 +281,7 @@ export function createHttpHandler(ctx) {
         res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length, "cache-control": "max-age=86400" });
         return res.end(jpeg);
       } catch (e) {
+        ctx.eventLog?.(`/recording-thumb ${sn} → 502: ${e?.message ?? e}`);
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }
@@ -294,9 +295,10 @@ export function createHttpHandler(ctx) {
       req.on("close", () => ac.abort());
       try {
         const mp4 = await ctx.downloadRecording(sn, storagePath, { signal: ac.signal });
-        res.writeHead(200, { "content-type": "video/mp4", "content-length": mp4.length, "cache-control": "no-store" });
+        res.writeHead(200, { "content-type": "video/mp4", "content-length": mp4.length, "cache-control": "no-store", "accept-ranges": "none" });
         return res.end(mp4);
       } catch (e) {
+        ctx.eventLog?.(`/recording ${sn} → 502: ${e?.message ?? e}`);
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }
