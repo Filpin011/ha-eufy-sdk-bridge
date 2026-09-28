@@ -158,6 +158,21 @@ export function createRecordings(ctx) {
     };
   }
 
+  // Pull the recording rows out of a 10017 reply, whichever shape the firmware used: the rows may be the
+  // payload of the history_record_info table (data:[{table_name, payload:[…]}]) or sit straight in data:[…].
+  function rowsFromReply(obj) {
+    const d = obj?.data;
+    if (d == null || d === "[]") return [];
+    const arr = Array.isArray(d) ? d : [d];
+    const tables = arr.filter((t) => t && typeof t === "object" && "table_name" in t);
+    if (tables.length) {
+      return tables
+        .filter((t) => t.table_name === "history_record_info")
+        .flatMap((t) => (Array.isArray(t.payload) ? t.payload : t.payload ? [t.payload] : []));
+    }
+    return arr.filter((r) => r && typeof r === "object");
+  }
+
   /** Recording rows for one YYYYMMDD day, newest first. */
   async function listRecordings(sn, day) {
     if (!/^\d{8}$/.test(String(day))) throw new Error("date must be YYYYMMDD");
@@ -172,11 +187,15 @@ export function createRecordings(ctx) {
       }
       const acct = await accountId();
 
-      // The 10017 calendar reply comes back as a CMD_DATABASE (1306) frame on the `data` channel
-      // (frame.json), or reassembled on `dbChunk`. Its shape is { cmd:10017, mIntRet:0, data:[ {
-      // table_name, payload:[…rows] } ] } — the rows are the payload of the history_record_info table,
-      // NOT reply.data itself. (Listening only to dbChunk / reading .data as the rows is why this read
-      // back 0B before.)
+      // The 10017 calendar reply can come back two ways, and BOTH must be handled or a busy session
+      // silently drops it:
+      //   • as a CMD_DATABASE (1306) frame on the `data` channel — frame.json carries { cmd:10017,
+      //     mIntRet, data:[…] } (this is what a quiet session gives);
+      //   • reassembled on `dbChunk` — a plain { data:[…] } with NO cmd field (this is what a session
+      //     under streaming load tends to give, and ignoring it for lacking `cmd` is why a healthy
+      //     camera read back 0B).
+      // The rows themselves are either the payload of the history_record_info table
+      // (data:[{table_name, payload:[…rows]}]) or, on some firmwares, the rows straight in data:[…].
       const reply = await new Promise((resolve) => {
         let settled = false;
         let chunk = "";
@@ -188,18 +207,20 @@ export function createRecordings(ctx) {
           session.off?.("dbChunk", onChunk);
           resolve({ val, raw });
         };
-        const consider = (obj, raw) => {
-          if (obj && obj.cmd === QUERY_LOCAL && obj.mIntRet === 0) done(obj, raw);
-          else if (obj && obj.cmd === QUERY_LOCAL && obj.mIntRet !== undefined) done(obj, raw); // rejection
-        };
         const onData = (frame) => {
           const id = frame?.commandId ?? frame?.commandType;
-          if (id === CMD_DATABASE && frame?.json) consider(frame.json, JSON.stringify(frame.json).length);
+          // Authoritative frame: trust it only when it's actually the 10017 reply (a concurrent 10000
+          // reply carries a different cmd and must not be mistaken for ours).
+          if (id === CMD_DATABASE && frame?.json?.cmd === QUERY_LOCAL) {
+            done(frame.json, JSON.stringify(frame.json).length);
+          }
         };
         const onChunk = ({ text }) => {
+          // dbChunk has no cmd; we hold the DB lock while listening, so any complete object reassembled
+          // here is our reply. Accept it once it parses and exposes a `data` field.
           chunk += text;
           const obj = firstJsonObject(chunk);
-          if (obj) consider(obj, chunk.length);
+          if (obj && ("data" in obj || obj.mIntRet !== undefined)) done(obj, chunk.length);
         };
         session.on("data", onData);
         session.on("dbChunk", onChunk);
@@ -216,11 +237,7 @@ export function createRecordings(ctx) {
         dbg(`recordings.list ${sn} ${day} — camera rejected (mIntRet=${obj.mIntRet})`);
         return [];
       }
-      const tables = obj?.data === "[]" || obj?.data == null ? [] : obj.data;
-      const raw = Array.isArray(tables)
-        ? tables.filter((t) => t?.table_name === "history_record_info").flatMap((t) => t.payload ?? [])
-        : [];
-      const rows = raw
+      const rows = rowsFromReply(obj)
         .map(normalize)
         .filter((r) => r.storage_path)
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
