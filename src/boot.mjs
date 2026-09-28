@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.33";
+const PROBE_BUILD = "probe.34";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -182,6 +182,110 @@ export function createBoot(ctx) {
    *
    * Their download data arrives on the BINARY channel, which is why that is watched most closely.
    */
+  /**
+   * Ask for the download AND tell the camera which key to wrap it for.
+   *
+   * The two-string form works: the camera answered 0, said CMD_CONVERT_MP4_OK, and streamed the clip
+   * back on the BINARY channel, record for record, byte for byte identical to the file. What it does
+   * not do is re-encrypt, so the keyframes arrive under the key they were written with.
+   *
+   * eufy-security-client's HB3 branch shows the other half: the request can carry `key`, the
+   * caller's own RSA modulus as uppercase hex — the same trick `encryptkey` plays at START_LIVE. If
+   * this camera honours it, the frames come wrapped for a key we hold and `decodeVideoFrame` opens
+   * them with no cipher from the cloud at all.
+   *
+   * So: that form first, the proven one as a fallback, and every frame that arrives is kept.
+   */
+  async function downloadWithOwnKey(session, clipPath, accountId) {
+    if (!session.connectAddress) return console.log("[own] no address");
+    const modulus = String(session.rsaModulus?.() ?? "").toUpperCase();
+    console.log(`[own] our modulus: ${modulus.length} hex chars`);
+
+    const frames = [];
+    let opened = false;
+    const onData = (f) => {
+      if (f?.commandName !== "CMD_VIDEO_FRAME" || !f.data?.length) return;
+      // Live frames are 1920x1080; the clip is 1280x720 — the width field tells them apart.
+      const w = f.data.length > 12 ? f.data.readUInt16LE(10) : 0;
+      if (w !== 1280) return;
+      frames.push(Buffer.from(f.data));
+      if (frames.length <= 3) console.log(`[own] clip frame ${frames.length}: ${f.data.length} bytes, key=${f.data[4] === 1}`);
+      if (f.data[4] === 1 && !opened) {
+        for (const sc of [1, 8, 0]) {
+          let out;
+          try {
+            out = session.decodeVideoFrame?.(f.data, sc);
+          } catch {
+            continue;
+          }
+          if (out && out[0] === 0 && out[1] === 0 && out[2] === 0 && out[3] === 1) {
+            opened = true;
+            console.log(`[own] *** keyframe OPENED at signCode ${sc}: ${out.subarray(0, 12).toString("hex")} nal ${out[4] & 0x1f} ***`);
+            break;
+          }
+        }
+        if (!opened) console.log("[own] keyframe still sealed — the camera kept its own key");
+      }
+    };
+    session.on("data", onData);
+
+    // A: the download request carrying our modulus.
+    console.log("[own] ── asking with our own key");
+    try {
+      session.sendSetPayload(1024, {}, {
+        rawValue: { account_id: accountId, cmd: 1024, mChannel: 0, mValue3: 1024, payload: { filepath: clipPath, key: modulus } },
+        wrapCmd: 1350,
+        channel: 0,
+        accountId,
+      });
+    } catch (e) {
+      console.log(`[own] send threw: ${e?.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 25000));
+    console.log(`[own] after A: ${frames.length} clip frames, keyframe opened: ${opened}`);
+
+    // B: the form already proven to work, so the transfer happens either way.
+    if (!frames.length) {
+      console.log("[own] ── falling back to the two-string form");
+      const pad128 = (str) => {
+        const b = Buffer.from(String(str));
+        const size = b.byteLength < 128 ? 128 : Math.ceil(b.byteLength / 128) * 128;
+        const o = Buffer.alloc(size);
+        b.copy(o);
+        return o;
+      };
+      const data = Buffer.concat([Buffer.alloc(5), pad128(clipPath), pad128(accountId)]);
+      const h = Buffer.allocUnsafe(2);
+      h.writeUInt16LE(data.length, 0);
+      const seq = (session.seqNumber ?? 0) & 0xffff;
+      const s2 = Buffer.allocUnsafe(2);
+      s2.writeUInt16BE(seq, 0);
+      const c2 = Buffer.allocUnsafe(2);
+      c2.writeUInt16LE(1024, 0);
+      session.seqNumber = (seq + 1) & 0xffff;
+      try {
+        session.send(
+          session.connectAddress,
+          Buffer.from([0xf1, 0xd0]),
+          Buffer.concat([Buffer.from([0xd1, 0x00]), s2, Buffer.from("XZYH"), c2, h, Buffer.from([0, 0, 1, 0, 0, 0, 0, 0]), data]),
+        );
+      } catch (e) {
+        console.log(`[own] fallback threw: ${e?.message}`);
+      }
+      await new Promise((r) => setTimeout(r, 30000));
+    }
+    session.off?.("data", onData);
+
+    console.log(`[own] collected ${frames.length} clip frames, keyframe opened: ${opened}`);
+    if (!frames.length) return;
+    try {
+      await fsp.writeFile("/data/downloaded.raw", Buffer.concat(frames));
+      console.log(`[own] wrote /data/downloaded.raw (${frames.reduce((a, b) => a + b.length, 0)} bytes)`);
+    } catch (e) {
+      console.log(`[own] could not write: ${e?.message}`);
+    }
+  }
+
   async function tryProperDownload(session, clipPath, accountId) {
     if (!session.connectAddress) return console.log("[dl] no address");
     const pad128 = (str) => {
@@ -988,7 +1092,7 @@ export function createBoot(ctx) {
     try {
       const savedBytes = await fsp.readFile(SAVED);
       await compareFrames(session, savedBytes, accountId);
-      await tryProperDownload(session, clip, accountId);
+      await downloadWithOwnKey(session, clip, accountId);
     } catch (e) {
       console.log(`[cmp] no saved clip to compare against: ${e?.message}`);
     }
