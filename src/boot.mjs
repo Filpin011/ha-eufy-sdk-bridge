@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.29";
+const PROBE_BUILD = "probe.30";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -73,6 +73,7 @@ export function createBoot(ctx) {
       haveClip = true; // the bytes are in hand; what is still wanted is playback
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
+      await inspectCipher();
       await tryUnwrap(saved);
       await tryEcies(saved);
       void kickoff("playback attempt");
@@ -476,6 +477,36 @@ export function createBoot(ctx) {
     }
     console.log("[ecies] none of the readings opened it");
     return undefined;
+  }
+
+  /**
+   * What does the cipher record ACTUALLY contain?
+   *
+   * The SDK types it as { cipher_id, ecc_private_key?, private_key? } and reads only the second.
+   * A type is a claim about what a caller needs, not an inventory of what arrives — so the server
+   * may well be sending more, and one of those fields may carry the same key with its case intact.
+   * Shapes only; no secret is printed.
+   */
+  async function inspectCipher() {
+    let all;
+    try {
+      all = await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn);
+    } catch (e) {
+      return console.log(`[cipher] getCiphers failed: ${e?.message ?? e}`);
+    }
+    if (!all?.length) return console.log("[cipher] nothing returned");
+    for (const c of all) {
+      console.log(`[cipher] record keys: ${Object.keys(c).join(", ")}`);
+      for (const [k, v] of Object.entries(c)) {
+        if (typeof v !== "string") {
+          console.log(`[cipher]   ${k}: ${typeof v} ${JSON.stringify(v)?.slice(0, 40)}`);
+          continue;
+        }
+        const upper = /[A-Z]/.test(v);
+        const kind = /^[0-9a-f]+$/i.test(v) ? "hex" : /-----/.test(v) ? "pem" : /^[A-Za-z0-9+/=s]+$/.test(v) ? "base64ish" : "other";
+        console.log(`[cipher]   ${k}: ${v.length} chars, ${kind}, uppercase: ${upper}`);
+      }
+    }
   }
 
   async function tryUnwrap(data) {
