@@ -282,17 +282,18 @@ export function createRecordings(ctx) {
   }
 
   // ── download + decrypt + mux ─────────────────────────────────────────────────────────────────────
-  // The start command is a normal level-1 control command: plaintext is 5 zero bytes + the length-prefixed
-  // storage path + the length-prefixed admin account id, AES-128-ECB-encrypted with the session's level-1
-  // key, then wrapped by the SDK's raw-command builder (channel 0, signCode 1). Sending it unencrypted /
-  // hand-framed is why the camera never returned an accept code.
+  // On a STANDALONE camera the start command is a two-string command sent IN THE CLEAR — isP2PCommandEncrypted
+  // (1024) is false, and it is NOT wrapped in CMD_SET_PAYLOAD (that's the HomeBase/T86P2 path). Verified wire
+  // shape on a T8171:
+  //   payload = [uint16 len][00 00][01 00][channel,0][00 00][5 zero bytes][storage_path @128][admin_id @128]
+  // where the two strings are 128-byte padded (stringWithLength). Encrypting it (the T86P2 form) gets silence;
+  // an earlier wrong envelope got -1/-104 rejections — the two-string cleartext form is the one it accepts.
   function buildDownloadFrame(session, storagePath, acct) {
-    const plain = Buffer.concat([Buffer.alloc(5), p2pCodec.stringWithLength(storagePath), p2pCodec.stringWithLength(acct)]);
-    const payload = p2pCodec.encryptP2PData(p2pCodec.paddingP2PData(plain), session.level1Key);
-    return Buffer.concat([
-      p2pCodec.buildCommandHeader(session.seqNumber, CMD_DOWNLOAD_VIDEO),
-      p2pCodec.buildRawCommandPayload(payload, 0, 1),
-    ]);
+    const data = Buffer.concat([Buffer.alloc(5), p2pCodec.stringWithLength(storagePath), p2pCodec.stringWithLength(acct)]);
+    const head = Buffer.allocUnsafe(2);
+    head.writeUInt16LE(data.length, 0);
+    const payload = Buffer.concat([head, Buffer.from([0, 0]), Buffer.from([1, 0]), Buffer.from([0, 0]), Buffer.from([0, 0]), data]);
+    return Buffer.concat([p2pCodec.buildCommandHeader(session.seqNumber, CMD_DOWNLOAD_VIDEO), payload]);
   }
 
   // Send the download command; resolve { frames, key } once the transfer settles.
