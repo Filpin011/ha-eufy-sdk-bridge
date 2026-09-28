@@ -355,12 +355,21 @@ export function createRecordings(ctx) {
         }
       };
       session.on("data", onData);
-      try {
+      // Send the start command, with a couple of resends if the accept code hasn't come yet — a single UDP
+      // datagram is occasionally dropped (the calendar query needs the same treatment). Each resend builds a
+      // fresh frame under the next sequence number.
+      const sendStart = () => {
+        if (settled || code) return;
         // Build with the current sequence number, then advance it, then send — the order the SDK's own
         // control-command senders use.
         const bytes = buildDownloadFrame(session, storagePath, acct);
         session.seqNumber = (session.seqNumber + 1) & 0xffff;
         session.send(session.connectAddress, p2pCodec.RequestMessageType.DATA, bytes);
+      };
+      try {
+        sendStart();
+        setTimeout(sendStart, 1500);
+        setTimeout(sendStart, 4000);
       } catch (e) {
         finish(e);
       }
@@ -377,6 +386,7 @@ export function createRecordings(ctx) {
         const session = await readySession(sn, signal);
         const acct = await accountId();
         const did = await p2pDidOf(sn);
+        dbg(`recordings.download ${sn} — acct=${acct || "EMPTY"} did=${did ? "set" : "MISSING"} l1=${session?.level1Key ? "set" : "MISSING"}`);
         const { frames, key } = await runDownload(session, storagePath, acct, sn, did, signal);
         if (!key) throw new Error("no key material from the download");
         if (!frames.length) throw new Error("download produced no frames");
