@@ -282,12 +282,17 @@ export function createRecordings(ctx) {
   }
 
   // ── download + decrypt + mux ─────────────────────────────────────────────────────────────────────
+  // The start command is a normal level-1 control command: plaintext is 5 zero bytes + the length-prefixed
+  // storage path + the length-prefixed admin account id, AES-128-ECB-encrypted with the session's level-1
+  // key, then wrapped by the SDK's raw-command builder (channel 0, signCode 1). Sending it unencrypted /
+  // hand-framed is why the camera never returned an accept code.
   function buildDownloadFrame(session, storagePath, acct) {
-    const data = Buffer.concat([Buffer.alloc(5), p2pCodec.stringWithLength(storagePath), p2pCodec.stringWithLength(acct)]);
-    const head = Buffer.allocUnsafe(2);
-    head.writeUInt16LE(data.length, 0);
-    const payload = Buffer.concat([head, Buffer.from([0, 0]), Buffer.from([1, 0]), Buffer.from([0, 0]), Buffer.from([0, 0]), data]);
-    return Buffer.concat([p2pCodec.buildCommandHeader(session.seqNumber, CMD_DOWNLOAD_VIDEO), payload]);
+    const plain = Buffer.concat([Buffer.alloc(5), p2pCodec.stringWithLength(storagePath), p2pCodec.stringWithLength(acct)]);
+    const payload = p2pCodec.encryptP2PData(p2pCodec.paddingP2PData(plain), session.level1Key);
+    return Buffer.concat([
+      p2pCodec.buildCommandHeader(session.seqNumber, CMD_DOWNLOAD_VIDEO),
+      p2pCodec.buildRawCommandPayload(payload, 0, 1),
+    ]);
   }
 
   // Send the download command; resolve { frames, key } once the transfer settles.
@@ -299,6 +304,8 @@ export function createRecordings(ctx) {
       let finished = false;
       let idle;
       const frames = [];
+      const seen = new Map(); // command id → count, so a no-ACK failure can say what the camera DID send
+      let firstDl; // first CMD_DOWNLOAD_VIDEO frame we couldn't read as an accept (hex head), for diagnosis
       const finish = (err, value) => {
         if (settled) return;
         settled = true;
@@ -315,7 +322,10 @@ export function createRecordings(ctx) {
       };
       const hardTimeout = setTimeout(() => finish(new Error("download timed out")), 90000);
       const acceptTimeout = setTimeout(() => {
-        if (!code) finish(new Error("camera did not accept the download (no code returned)"));
+        if (code) return;
+        const tally = [...seen.entries()].map(([k, v]) => `${k}:${v}`).join(", ") || "nothing";
+        dbg(`recordings.download no ACK in 15s — camera sent [${tally}]${firstDl ? ` | 1024 head=${firstDl}` : ""}`);
+        finish(new Error("camera did not accept the download (no code returned)"));
       }, 15000);
       const onAbort = () => finish(new Error("download aborted"));
       signal?.addEventListener?.("abort", onAbort, { once: true });
@@ -323,7 +333,8 @@ export function createRecordings(ctx) {
       const onData = (frame) => {
         const id = frame?.commandId ?? frame?.commandType;
         const d = frame?.data;
-        if (id === CMD_DOWNLOAD_VIDEO && d?.length >= 5 && d.readInt32LE(0) === 0 && !code) {
+        if (id !== undefined) seen.set(id, (seen.get(id) ?? 0) + 1);
+        if (id === CMD_DOWNLOAD_VIDEO && Buffer.isBuffer(d) && d.length >= 5 && d.readInt32LE(0) === 0 && !code) {
           code = d.subarray(4).toString("ascii").replace(/\0.*$/s, "");
           try {
             key = aesKeyFor(serial, did, code);
@@ -331,6 +342,10 @@ export function createRecordings(ctx) {
             return finish(new Error(`key derivation failed: ${e?.message}`));
           }
           dbg(`recordings.download accepted, code=${code}`);
+        } else if (id === CMD_DOWNLOAD_VIDEO && Buffer.isBuffer(d) && !code) {
+          // A 1024 frame that isn't our "accept" shape — capture it once. A non-zero int32 head is the
+          // camera's rejection code; this makes it visible instead of silently waiting out the timeout.
+          if (!firstDl) firstDl = d.subarray(0, 24).toString("hex");
         } else if (id === CMD_VIDEO_FRAME && d?.length > 22) {
           frames.push(Buffer.from(d));
           settleSoon();
@@ -341,8 +356,11 @@ export function createRecordings(ctx) {
       };
       session.on("data", onData);
       try {
+        // Build with the current sequence number, then advance it, then send — the order the SDK's own
+        // control-command senders use.
+        const bytes = buildDownloadFrame(session, storagePath, acct);
         session.seqNumber = (session.seqNumber + 1) & 0xffff;
-        session.send(session.connectAddress, p2pCodec.RequestMessageType.DATA, buildDownloadFrame(session, storagePath, acct));
+        session.send(session.connectAddress, p2pCodec.RequestMessageType.DATA, bytes);
       } catch (e) {
         finish(e);
       }
