@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.32";
+const PROBE_BUILD = "probe.33";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -167,6 +167,72 @@ export function createBoot(ctx) {
       Buffer.from([0x00, 0x00]),
       data,
     ]);
+  }
+
+  /**
+   * CMD_DOWNLOAD_VIDEO the way a working implementation sends it.
+   *
+   * eufy-security-client, for a camera that is not an HB3, does not wrap this in CMD_SET_PAYLOAD at
+   * all. It sends a two-string command: the command type IS 1024, the path is one string and the
+   * admin user id the other, each padded into its own 128-byte buffer, preceded by five zero bytes.
+   *
+   * And `isP2PCommandEncrypted(1024)` is false — the payload goes out in the CLEAR. Every attempt
+   * here so far encrypted it with the level-1 key and wrapped it in 1350, which is two reasons for a
+   * camera to answer -1 while understanding perfectly well what was meant.
+   *
+   * Their download data arrives on the BINARY channel, which is why that is watched most closely.
+   */
+  async function tryProperDownload(session, clipPath, accountId) {
+    if (!session.connectAddress) return console.log("[dl] no address");
+    const pad128 = (str) => {
+      const b = Buffer.from(String(str));
+      const size = b.byteLength < 128 ? 128 : Math.ceil(b.byteLength / 128) * 128;
+      const out = Buffer.alloc(size);
+      b.copy(out);
+      return out;
+    };
+    const data = Buffer.concat([Buffer.alloc(5), pad128(clipPath), pad128(accountId)]);
+    const head = Buffer.allocUnsafe(2);
+    head.writeUInt16LE(data.length, 0);
+    const payload = Buffer.concat([
+      head,
+      Buffer.from([0x00, 0x00]),
+      Buffer.from([0x01, 0x00]),
+      Buffer.from([0x00, 0x00]), // channel 0, encryption 0 — 1024 is not an encrypted command
+      Buffer.from([0x00, 0x00]),
+      data,
+    ]);
+    const seq = (session.seqNumber ?? 0) & 0xffff;
+    const s2 = Buffer.allocUnsafe(2);
+    s2.writeUInt16BE(seq, 0);
+    const c2 = Buffer.allocUnsafe(2);
+    c2.writeUInt16LE(1024, 0); // the command IS 1024 — not wrapped in 1350
+    const body = Buffer.concat([Buffer.from([0xd1, 0x00]), s2, Buffer.from("XZYH"), c2, payload]);
+
+    const seen = { any: 0, binary: 0, bytes: 0 };
+    const onData = (f) => {
+      seen.any++;
+      if (f?.dataType === 3) {
+        seen.binary++;
+        seen.bytes += f?.data?.length ?? 0;
+        if (seen.binary <= 8) console.log(`[dl] BINARY ${f.commandName} ${f.data?.length ?? 0} bytes ${f.data?.subarray(0, 16).toString("hex")}`);
+      } else if (f?.commandName !== "CMD_VIDEO_FRAME" && f?.commandName !== "CMD_AUDIO_FRAME" && seen.any <= 30) {
+        const js = f?.json ? " json=" + JSON.stringify(f.json).slice(0, 140) : "";
+        console.log(`[dl] ${f?.commandName} (type ${f?.dataType}) ${f?.data?.length ?? 0}B ${f?.data?.subarray(0, 8).toString("hex")}${js}`);
+      }
+    };
+    session.on("data", onData);
+    console.log(`[dl] sending CMD_DOWNLOAD_VIDEO, plaintext, two strings (${data.length}B payload)`);
+    try {
+      session.seqNumber = (seq + 1) & 0xffff;
+      session.send(session.connectAddress, Buffer.from([0xf1, 0xd0]), body);
+    } catch (e) {
+      session.off?.("data", onData);
+      return console.log(`[dl] send threw: ${e?.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 30000));
+    session.off?.("data", onData);
+    console.log(`[dl] result: ${seen.any} frames, ${seen.binary} on BINARY, ${seen.bytes} bytes of payload`);
   }
 
   async function tryBinaryChannel(session, clipPath, accountId) {
@@ -922,7 +988,7 @@ export function createBoot(ctx) {
     try {
       const savedBytes = await fsp.readFile(SAVED);
       await compareFrames(session, savedBytes, accountId);
-      await tryBinaryChannel(session, clip, accountId);
+      await tryProperDownload(session, clip, accountId);
     } catch (e) {
       console.log(`[cmp] no saved clip to compare against: ${e?.message}`);
     }
