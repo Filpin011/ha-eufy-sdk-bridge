@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.27";
+const PROBE_BUILD = "probe.28";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -123,13 +123,16 @@ export function createBoot(ctx) {
     };
     session.on("data", onData);
 
+    // Not startLiveMedia: called with channel 0 it answered -104. What did work was the app's own
+    // envelope, read from startLiveJson and sent raw — so use exactly that, unchanged.
     console.log("[cmp] starting live to catch a keyframe…");
     try {
-      session.startLiveMedia?.(0, lastClip?.accountId ?? "", false);
+      const env = JSON.parse(String(session.startLiveJson(0, lastClip?.accountId ?? "")));
+      session.sendSetPayload(1000, {}, { rawValue: env, wrapCmd: 1700, channel: 0, accountId: lastClip?.accountId });
     } catch (e) {
-      console.log(`[cmp] startLiveMedia threw: ${e?.message}`);
+      console.log(`[cmp] start threw: ${e?.message}`);
     }
-    for (let i = 0; i < 40 && !live.length; i++) await new Promise((r) => setTimeout(r, 500));
+    for (let i = 0; i < 60 && !live.length; i++) await new Promise((r) => setTimeout(r, 500));
     try {
       session.stopLiveMedia?.(0);
     } catch {
