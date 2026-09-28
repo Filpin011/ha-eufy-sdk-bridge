@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.38";
+const PROBE_BUILD = "probe.39";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -911,6 +911,8 @@ export function createBoot(ctx) {
     console.log(`[full] wrote /data/decoded.h264 (${h264.length} bytes)`);
     const tail = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
     execFile("ffmpeg", ["-y", "-f", "h264", "-r", "15", "-i", "/data/decoded.h264", "-c", "copy", "/data/decoded.mp4"], (e, _o, se) => {
+      // Deliver it somewhere the editor can open. /share, if the add-on map took effect; else /data.
+      (async () => { try { await fsp.mkdir("/share/eufy-probe", { recursive: true }); await fsp.copyFile("/data/decoded.mp4", "/share/eufy-probe/decoded.mp4"); console.log("[full] copied -> /share/eufy-probe/decoded.mp4 (open it from the editor)"); } catch (err) { console.log(`[full] /share not reachable (${err?.message}); the file is at /data/decoded.mp4 inside the add-on`); } })();
       console.log(`[full] ffmpeg: ${e ? "FAILED " + tail(se) : "ok -> /data/decoded.mp4"}`);
       execFile("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration,size", "-of", "default=nw=1", "/data/decoded.mp4"], (e2, o2, s2) => {
         console.log(`[full] ffprobe: ${e2 ? "REFUSED " + tail(s2) : String(o2).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`);
