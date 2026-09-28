@@ -382,8 +382,10 @@ export function createRecordings(ctx) {
     dbg(`recordings.download ${sn} — requested ${storagePath}`);
     if (typeof storagePath !== "string" || !storagePath.endsWith(".zxvideo")) throw new Error(`bad recording path: ${storagePath}`);
     return withDbLock(async () => {
+      dbg(`recordings.download ${sn} — lock acquired, readying session`);
       try {
         const session = await readySession(sn, signal);
+        dbg(`recordings.download ${sn} — session ready, resolving account`);
         const acct = await accountId();
         const did = await p2pDidOf(sn);
         dbg(`recordings.download ${sn} — acct=${acct || "EMPTY"} did=${did ? "set" : "MISSING"} l1=${session?.level1Key ? "set" : "MISSING"}`);
