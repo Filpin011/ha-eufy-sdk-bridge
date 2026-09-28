@@ -388,7 +388,8 @@ export function createRecordings(ctx) {
         dbg(`recordings.download ${sn} — session ready, resolving account`);
         const acct = await accountId();
         const did = await p2pDidOf(sn);
-        dbg(`recordings.download ${sn} — acct=${acct || "EMPTY"} did=${did ? "set" : "MISSING"} l1=${session?.level1Key ? "set" : "MISSING"}`);
+        const addr = session?.connectAddress ? `${session.connectAddress.host}:${session.connectAddress.port}` : "none";
+        dbg(`recordings.download ${sn} — acct=${acct || "EMPTY"} did=${did ? "set" : "MISSING"} l1=${session?.level1Key ? "set" : "MISSING"} addr=${addr}`);
         const { frames, key } = await runDownload(session, storagePath, acct, sn, did, signal);
         if (!key) throw new Error("no key material from the download");
         if (!frames.length) throw new Error("download produced no frames");
