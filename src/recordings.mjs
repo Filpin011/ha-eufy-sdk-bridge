@@ -104,7 +104,9 @@ function muxToMp4(annexb) {
 export function createRecordings(ctx) {
   const { eufy } = ctx;
   const withDbLock = (fn) => (ctx.withDbLock ? ctx.withDbLock(fn) : fn());
-  const dbg = ctx.dbg ?? (() => {});
+  // Log at the visible "[bridge:event]" level (on by default) so a browse/play attempt can be traced
+  // without turning on debug — this path is new and worth watching.
+  const dbg = ctx.eventLog ?? ctx.dbg ?? (() => {});
 
   const stationSession = (sn) => (eufy.getP2pSessions?.() ?? new Map()).get(sn);
   async function accountId() {
@@ -158,8 +160,15 @@ export function createRecordings(ctx) {
   /** Recording rows for one YYYYMMDD day, newest first. */
   async function listRecordings(sn, day) {
     if (!/^\d{8}$/.test(String(day))) throw new Error("date must be YYYYMMDD");
+    dbg(`recordings.list ${sn} ${day} — requested`);
     return withDbLock(async () => {
-      const session = await readySession(sn);
+      let session;
+      try {
+        session = await readySession(sn);
+      } catch (e) {
+        dbg(`recordings.list ${sn} ${day} — session failed: ${e?.message ?? e}`);
+        throw e;
+      }
       const acct = await accountId();
       let chunk = "";
       const onChunk = ({ text }) => (chunk += text);
@@ -183,7 +192,7 @@ export function createRecordings(ctx) {
         .map(normalize)
         .filter((r) => r.storage_path)
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
-      dbg(`recordings.list ${sn} ${day} → ${rows.length}`);
+      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (raw ${chunk.length}B received)`);
       return rows;
     });
   }
