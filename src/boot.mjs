@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.37";
+const PROBE_BUILD = "probe.38";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -76,6 +76,7 @@ export function createBoot(ctx) {
       await inspectCipher();
       await tryOlderCipherApi(lastClip?.accountId, lastClip?.stationSn);
       await tryImageKey();
+      await decodeWholeClip();
       await tryNodeRsa();
       await legacyCipher(lastClip?.stationSn);
       await tryUnwrap(saved);
@@ -848,6 +849,73 @@ export function createBoot(ctx) {
       }
     }
     return Buffer.from(h.slice(16)).toString("hex").toUpperCase();
+  }
+
+  /**
+   * The whole clip, decrypted and muxed — the proof that the key works end to end.
+   *
+   * One code decrypts the entire recording (two keyframes shared 32 ciphertext bytes → one key per
+   * clip). For each record: the 22-byte inner header is dropped; a keyframe has its first 128 payload
+   * bytes AES-128-ECB decrypted and the rest is already plain; a P-frame is plain throughout. The
+   * concatenation is an Annex-B stream, handed to ffmpeg -c copy for an MP4, then measured.
+   */
+  async function decodeWholeClip() {
+    const serial = lastClip?.stationSn || "T8171T1025250770";
+    const code = process.env.PROBE_CODE || "0191634706";
+    let did;
+    try {
+      const devs = await eufy.getDevices();
+      did = (devs.find((x) => x?.sn === serial) ?? devs[0])?.raw?.p2p_did;
+    } catch (e) {
+      return console.log(`[full] getDevices failed: ${e?.message ?? e}`);
+    }
+    if (!did) return console.log("[full] no p2p_did");
+    const key = Buffer.from(imageKeyHex(serial, did, code), "ascii").subarray(0, 16);
+
+    let saved;
+    try {
+      saved = await fsp.readFile(SAVED);
+    } catch (e) {
+      return console.log(`[full] no saved clip: ${e?.message}`);
+    }
+
+    const out = [];
+    let keyframes = 0, pframes = 0, opened = 0;
+    for (let i = 0; i + 16 <= saved.length; ) {
+      if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+      const len = saved.readUInt32LE(i + 6);
+      const isKey = saved[i + 13] === 1;
+      const payload = saved.subarray(i + 16 + 22, i + 16 + len); // drop the 22-byte inner header
+      i += 16 + len;
+      if (isKey) {
+        keyframes++;
+        try {
+          const d = crypto.createDecipheriv("aes-128-ecb", key, null);
+          d.setAutoPadding(false);
+          const head = Buffer.concat([d.update(payload.subarray(0, 128)), d.final()]);
+          if (head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1) opened++;
+          out.push(Buffer.concat([head, payload.subarray(128)]));
+        } catch (e) {
+          console.log(`[full] keyframe decrypt failed: ${e?.message}`);
+          out.push(payload);
+        }
+      } else {
+        pframes++;
+        out.push(payload);
+      }
+    }
+    console.log(`[full] ${keyframes} keyframes (${opened} opened cleanly), ${pframes} p-frames`);
+
+    const h264 = Buffer.concat(out);
+    await fsp.writeFile("/data/decoded.h264", h264);
+    console.log(`[full] wrote /data/decoded.h264 (${h264.length} bytes)`);
+    const tail = (t) => String(t).split(String.fromCharCode(10)).filter(Boolean).slice(-2).join(" | ");
+    execFile("ffmpeg", ["-y", "-f", "h264", "-r", "15", "-i", "/data/decoded.h264", "-c", "copy", "/data/decoded.mp4"], (e, _o, se) => {
+      console.log(`[full] ffmpeg: ${e ? "FAILED " + tail(se) : "ok -> /data/decoded.mp4"}`);
+      execFile("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration,size", "-of", "default=nw=1", "/data/decoded.mp4"], (e2, o2, s2) => {
+        console.log(`[full] ffprobe: ${e2 ? "REFUSED " + tail(s2) : String(o2).replace(new RegExp(String.fromCharCode(10), "g"), " ")}`);
+      });
+    });
   }
 
   async function tryImageKey() {
