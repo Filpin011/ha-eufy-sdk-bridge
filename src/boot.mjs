@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.31";
+const PROBE_BUILD = "probe.32";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -74,6 +74,7 @@ export function createBoot(ctx) {
       console.log(`[probe] analysing the saved clip (${saved.length} bytes) — the camera is not needed`);
       await analyse(saved);
       await inspectCipher();
+      await tryOlderCipherApi(lastClip?.accountId, lastClip?.stationSn);
       await tryUnwrap(saved);
       await tryEcies(saved);
       void kickoff("playback attempt");
@@ -585,6 +586,83 @@ export function createBoot(ctx) {
    * may well be sending more, and one of those fields may carry the same key with its case intact.
    * Shapes only; no secret is printed.
    */
+  /**
+   * Ask the older cipher endpoints for the same key.
+   *
+   * eufy-security-client — which does implement stored-clip download, and decrypts it with
+   * `cipher.private_key` — fetches it from `v2/app/cipher/get_ciphers`. This SDK asks
+   * `/v3/app/cipher/get_ciphers`. The v3 answer arrives with every letter lowercased, which no
+   * OpenSSL will read; so the obvious question is what v1 and v2 answer.
+   *
+   * `securityAppPost` takes any path, so this costs one request each. Shapes only.
+   */
+  async function tryOlderCipherApi(accountId, stationSn) {
+    if (!accountId || !stationSn) {
+      try {
+        const devs = await eufy.getDevices();
+        accountId = accountId ?? devs.find((d) => d.raw?.member?.admin_user_id)?.raw?.member?.admin_user_id;
+        stationSn = stationSn ?? devs[0]?.sn;
+      } catch {
+        /* best effort */
+      }
+    }
+    console.log(`[v2] account ${accountId ? "ok" : "MISSING"}, station ${stationSn ?? "?"}`);
+    if (!accountId) return;
+    const shape = (v) => {
+      if (typeof v !== "string") return `${typeof v} ${JSON.stringify(v)?.slice(0, 30)}`;
+      const kind = /-----/.test(v) ? "pem" : /^[0-9a-f]+$/i.test(v) ? "hex" : "other";
+      return `${v.length} chars, ${kind}, uppercase: ${/[A-Z]/.test(v)}`;
+    };
+    for (const path of ["/v2/app/cipher/get_ciphers", "/v1/app/cipher/get_ciphers", "v2/app/cipher/get_ciphers"]) {
+      let out;
+      try {
+        out = await eufy.api?.securityAppPost?.(path, {
+          cipher_ids: [95],
+          user_id: accountId,
+          station_sn: stationSn,
+          transaction: String(Date.now()),
+        });
+      } catch (e) {
+        console.log(`[v2] ${path}: ${String(e?.message).slice(0, 90)}`);
+        continue;
+      }
+      const rows = Array.isArray(out) ? out : (out?.ciphers ?? out?.data ?? (out ? [out] : []));
+      console.log(`[v2] ${path}: ${Array.isArray(rows) ? rows.length + " row(s)" : typeof rows}`);
+      for (const r of Array.isArray(rows) ? rows : []) {
+        if (!r || typeof r !== "object") {
+          console.log(`[v2]   row: ${String(r).slice(0, 60)}`);
+          continue;
+        }
+        console.log(`[v2]   keys: ${Object.keys(r).join(", ")}`);
+        for (const [k, v] of Object.entries(r)) console.log(`[v2]     ${k}: ${shape(v)}`);
+        // If one of them is a readable PEM, use it on the stored keyframe at once.
+        for (const [k, v] of Object.entries(r)) {
+          if (typeof v !== "string" || !/-----/.test(v) || !/[A-Z]/.test(v)) continue;
+          console.log(`[v2]   *** ${k} has its case intact — trying it on the clip ***`);
+          try {
+            const saved = await fsp.readFile(SAVED);
+            let body;
+            for (let i = 0; i + 16 <= saved.length; ) {
+              if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+              const len = saved.readUInt32LE(i + 6);
+              if (saved[i + 13] === 1 && !body) body = saved.subarray(i + 16, i + 16 + len);
+              i += 16 + len;
+            }
+            if (!body) break;
+            const aes = crypto.privateDecrypt({ key: v, padding: crypto.constants.RSA_PKCS1_PADDING }, body.subarray(22, 150));
+            const d = crypto.createDecipheriv(aes.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", aes.subarray(0, aes.length >= 32 ? 32 : 16), null);
+            d.setAutoPadding(false);
+            const head = Buffer.concat([d.update(body.subarray(151, 279)), d.final()]);
+            const ok = head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1;
+            console.log(`[v2]   decrypted head: ${head.subarray(0, 12).toString("hex")} ${ok ? "*** START CODE, nal " + (head[4] & 0x1f) + " — THE CLIP IS OPEN ***" : ""}`);
+          } catch (e) {
+            console.log(`[v2]   failed on the clip: ${String(e?.message).slice(0, 70)}`);
+          }
+        }
+      }
+    }
+  }
+
   async function inspectCipher() {
     let all;
     try {
