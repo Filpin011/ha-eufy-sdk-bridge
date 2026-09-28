@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.35";
+const PROBE_BUILD = "probe.36";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -75,6 +75,7 @@ export function createBoot(ctx) {
       await analyse(saved);
       await inspectCipher();
       await tryOlderCipherApi(lastClip?.accountId, lastClip?.stationSn);
+      await tryNodeRsa();
       await legacyCipher(lastClip?.stationSn);
       await tryUnwrap(saved);
       await tryEcies(saved);
@@ -782,6 +783,91 @@ export function createBoot(ctx) {
    * It logs in ONCE and never retries: a second attempt on a rate-limited account is how the
    * "hit max login limit" wall gets hit, and one refusal already answers the question.
    */
+  /**
+   * The last unasked question: is only the header lowercased, or the base64 body too?
+   *
+   * Every attempt so far fed the PEM to OpenSSL (`crypto.privateDecrypt`), which rejects it at the
+   * DECODER stage — a FORMAT refusal, before the key data is even considered. eufy-security-client,
+   * which decrypts downloads on other setups, imports it with node-rsa instead: a pure-JS parser that
+   * strips the markers and decodes the base64 itself. If the mangling is cosmetic — just the
+   * BEGIN/END markers — node-rsa reads the key and OpenSSL was simply being strict. If node-rsa fails
+   * too, the base64 body is corrupt and the key is gone at the source, beyond any parser.
+   *
+   * Runs on the saved clip and the getCiphers call we already make. No camera, no second login.
+   */
+  async function tryNodeRsa() {
+    let NodeRSA;
+    try {
+      NodeRSA = (await import("node-rsa")).default;
+    } catch (e) {
+      return console.log(`[nrsa] node-rsa not available: ${e?.message}`);
+    }
+    let pem;
+    try {
+      pem = (await eufy.api?.getCiphers?.([95], lastClip?.accountId, lastClip?.stationSn))?.[0]?.private_key;
+    } catch (e) {
+      return console.log(`[nrsa] getCiphers failed: ${e?.message ?? e}`);
+    }
+    if (!pem) return console.log("[nrsa] no private_key");
+
+    // The saved keyframe's wrapped AES key (bytes 22..150 of the keyframe body).
+    let wrapped;
+    try {
+      const saved = await fsp.readFile(SAVED);
+      for (let i = 0; i + 16 <= saved.length; ) {
+        if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+        const len = saved.readUInt32LE(i + 6);
+        if (saved[i + 13] === 1 && !wrapped) wrapped = saved.subarray(i + 16 + 22, i + 16 + 22 + 128);
+        i += 16 + len;
+      }
+    } catch (e) {
+      return console.log(`[nrsa] no saved clip: ${e?.message}`);
+    }
+    if (!wrapped) return console.log("[nrsa] no keyframe in the saved clip");
+
+    // node-rsa the way eufy-security-client does it: strip newlines, strip markers, importKey.
+    const body = String(pem).replace(/\r?\n/g, "").replace(/-----[^-]+-----/gi, "");
+    const attempts = [
+      ["as received", String(pem)],
+      ["body only (esec style)", body],
+      ["markers UPPER + wrapped 64", "-----BEGIN RSA PRIVATE KEY-----\n" + (body.match(/.{1,64}/g) ?? []).join("\n") + "\n-----END RSA PRIVATE KEY-----"],
+    ];
+    for (const [label, input] of attempts) {
+      for (const fmt of ["pkcs1-private-pem", "pkcs8-private-pem", "private", "pkcs1", "pkcs8"]) {
+        try {
+          const key = new NodeRSA();
+          key.importKey(input, fmt);
+          console.log(`[nrsa] IMPORTED via ${label} / ${fmt} — key is ${key.getKeySize()} bits`);
+          // If it imported, try to actually unwrap the AES key.
+          try {
+            key.setOptions({ encryptionScheme: "pkcs1" });
+            const aes = key.decrypt(Buffer.from(wrapped));
+            console.log(`[nrsa]   unwrapped ${aes.length} bytes: ${aes.subarray(0, 16).toString("hex")}`);
+            const d = crypto.createDecipheriv(aes.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", aes.subarray(0, aes.length >= 32 ? 32 : 16), null);
+            d.setAutoPadding(false);
+            const saved = await fsp.readFile(SAVED);
+            let kf;
+            for (let i = 0; i + 16 <= saved.length; ) {
+              if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+              const len = saved.readUInt32LE(i + 6);
+              if (saved[i + 13] === 1 && !kf) kf = saved.subarray(i + 16, i + 16 + len);
+              i += 16 + len;
+            }
+            const head = Buffer.concat([d.update(kf.subarray(151, 279)), d.final()]);
+            const ok = head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1;
+            console.log(`[nrsa]   head: ${head.subarray(0, 12).toString("hex")} ${ok ? "*** START CODE — THE CLIP IS OPEN ***" : "(no start code)"}`);
+            return;
+          } catch (e) {
+            console.log(`[nrsa]   imported but unwrap failed: ${String(e?.message).slice(0, 60)}`);
+          }
+        } catch {
+          /* this format did not take */
+        }
+      }
+    }
+    console.log("[nrsa] node-rsa could not import it either — the base64 body is corrupt, the key is gone at the source");
+  }
+
   async function legacyCipher(stationSn) {
     let mod;
     try {
