@@ -187,8 +187,8 @@ export function createRecordings(ctx) {
       }
       const acct = await accountId();
 
-      // The 10017 calendar reply can come back two ways, and BOTH must be handled or a busy session
-      // silently drops it:
+      // One send-and-await-reply. The 10017 calendar reply can come back two ways, and BOTH must be
+      // handled or a busy session silently drops it:
       //   • as a CMD_DATABASE (1306) frame on the `data` channel — frame.json carries { cmd:10017,
       //     mIntRet, data:[…] } (this is what a quiet session gives);
       //   • reassembled on `dbChunk` — a plain { data:[…] } with NO cmd field (this is what a session
@@ -196,52 +196,68 @@ export function createRecordings(ctx) {
       //     camera read back 0B).
       // The rows themselves are either the payload of the history_record_info table
       // (data:[{table_name, payload:[…rows]}]) or, on some firmwares, the rows straight in data:[…].
-      const reply = await new Promise((resolve) => {
-        let settled = false;
-        let chunk = "";
-        const done = (val, raw) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          session.off?.("data", onData);
-          session.off?.("dbChunk", onChunk);
-          resolve({ val, raw });
-        };
-        const onData = (frame) => {
-          const id = frame?.commandId ?? frame?.commandType;
-          // Authoritative frame: trust it only when it's actually the 10017 reply (a concurrent 10000
-          // reply carries a different cmd and must not be mistaken for ours).
-          if (id === CMD_DATABASE && frame?.json?.cmd === QUERY_LOCAL) {
-            done(frame.json, JSON.stringify(frame.json).length);
-          }
-        };
-        const onChunk = ({ text }) => {
-          // dbChunk has no cmd; we hold the DB lock while listening, so any complete object reassembled
-          // here is our reply. Accept it once it parses and exposes a `data` field.
-          chunk += text;
-          const obj = firstJsonObject(chunk);
-          if (obj && ("data" in obj || obj.mIntRet !== undefined)) done(obj, chunk.length);
-        };
-        session.on("data", onData);
-        session.on("dbChunk", onChunk);
-        const send = () =>
-          session.isConnected &&
-          session.queryDatabase("history_record_info", { accountId: acct, channel: 0, innerCmd: QUERY_LOCAL, query: calendarQuery(day) });
-        send();
-        setTimeout(send, 1500); // the first datagram is occasionally dropped; one resend covers it
-        const timer = setTimeout(() => done(undefined, chunk.length), 14000);
-      });
+      const attemptQuery = () =>
+        new Promise((resolve) => {
+          let settled = false;
+          let chunk = "";
+          const done = (val, raw) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            session.off?.("data", onData);
+            session.off?.("dbChunk", onChunk);
+            resolve({ val, raw });
+          };
+          const onData = (frame) => {
+            const id = frame?.commandId ?? frame?.commandType;
+            // Authoritative frame: trust it only when it's actually the 10017 reply (a concurrent 10000
+            // reply carries a different cmd and must not be mistaken for ours).
+            if (id === CMD_DATABASE && frame?.json?.cmd === QUERY_LOCAL) {
+              done(frame.json, JSON.stringify(frame.json).length);
+            }
+          };
+          const onChunk = ({ text }) => {
+            // dbChunk has no cmd; we hold the DB lock while listening, so any complete object reassembled
+            // here is our reply. Accept it once it parses and exposes a `data`/`mIntRet` field.
+            chunk += text;
+            const obj = firstJsonObject(chunk);
+            if (obj && ("data" in obj || obj.mIntRet !== undefined)) done(obj, chunk.length);
+          };
+          session.on("data", onData);
+          session.on("dbChunk", onChunk);
+          const send = () =>
+            session.isConnected &&
+            session.queryDatabase("history_record_info", { accountId: acct, channel: 0, innerCmd: QUERY_LOCAL, query: calendarQuery(day) });
+          send();
+          setTimeout(send, 1200); // the first datagram is occasionally dropped; one resend covers it
+          const timer = setTimeout(() => done(undefined, chunk.length), 8000);
+        });
 
-      const obj = reply.val;
+      // A freshly-(re)connected or busy camera rejects the query with a negative mIntRet (seen: -1100)
+      // or just drops it; the very next attempt usually succeeds. So retry — like the eufy app does —
+      // until we get mIntRet:0 (even for an empty day), bounded well under the HA-side 45s ceiling.
+      let obj;
+      let raw = 0;
+      const deadline = Date.now() + 40_000;
+      for (let attempt = 1; attempt <= 6 && Date.now() < deadline; attempt++) {
+        const reply = await attemptQuery();
+        obj = reply.val;
+        raw = reply.raw ?? 0;
+        const code = obj?.mIntRet;
+        if (obj && code === 0) break; // accepted (rows or an empty day)
+        dbg(`recordings.list ${sn} ${day} — ${code !== undefined ? `rejected (mIntRet=${code})` : "no reply"}, retry ${attempt}`);
+        await sleep(900);
+      }
+
       if (obj && obj.mIntRet !== undefined && obj.mIntRet !== 0) {
-        dbg(`recordings.list ${sn} ${day} — camera rejected (mIntRet=${obj.mIntRet})`);
+        dbg(`recordings.list ${sn} ${day} — gave up (mIntRet=${obj.mIntRet})`);
         return [];
       }
       const rows = rowsFromReply(obj)
         .map(normalize)
         .filter((r) => r.storage_path)
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
-      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (reply ${reply.raw ?? 0}B, mIntRet=${obj?.mIntRet ?? "none"})`);
+      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (reply ${raw}B, mIntRet=${obj?.mIntRet ?? "none"})`);
       return rows;
     });
   }
