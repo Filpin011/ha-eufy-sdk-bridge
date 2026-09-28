@@ -17,6 +17,7 @@ import { firstJsonObject } from "./faces.mjs";
 
 const { p2pCodec } = sdk;
 const CMD_DOWNLOAD_VIDEO = 1024;
+const CMD_DATABASE = 1306; // the query reply frame (carries the calendar rows as JSON)
 const CMD_VIDEO_FRAME = 1300;
 const CMD_CONVERT_MP4_OK = 1303;
 const CMD_DOWNLOAD_FINISH = 1304;
@@ -170,29 +171,60 @@ export function createRecordings(ctx) {
         throw e;
       }
       const acct = await accountId();
-      let chunk = "";
-      const onChunk = ({ text }) => (chunk += text);
-      session.on("dbChunk", onChunk);
-      const send = () =>
-        session.isConnected &&
-        session.queryDatabase("history_record_info", { accountId: acct, channel: 0, innerCmd: QUERY_LOCAL, query: calendarQuery(day) });
-      send();
-      setTimeout(send, 1500); // the first datagram is occasionally dropped; one resend covers it
-      let parsed;
-      for (let i = 0; i < 70; i++) {
-        await sleep(200);
-        const obj = firstJsonObject(chunk);
-        if (obj && Array.isArray(obj.data)) {
-          parsed = obj;
-          break;
-        }
+
+      // The 10017 calendar reply comes back as a CMD_DATABASE (1306) frame on the `data` channel
+      // (frame.json), or reassembled on `dbChunk`. Its shape is { cmd:10017, mIntRet:0, data:[ {
+      // table_name, payload:[…rows] } ] } — the rows are the payload of the history_record_info table,
+      // NOT reply.data itself. (Listening only to dbChunk / reading .data as the rows is why this read
+      // back 0B before.)
+      const reply = await new Promise((resolve) => {
+        let settled = false;
+        let chunk = "";
+        const done = (val, raw) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          session.off?.("data", onData);
+          session.off?.("dbChunk", onChunk);
+          resolve({ val, raw });
+        };
+        const consider = (obj, raw) => {
+          if (obj && obj.cmd === QUERY_LOCAL && obj.mIntRet === 0) done(obj, raw);
+          else if (obj && obj.cmd === QUERY_LOCAL && obj.mIntRet !== undefined) done(obj, raw); // rejection
+        };
+        const onData = (frame) => {
+          const id = frame?.commandId ?? frame?.commandType;
+          if (id === CMD_DATABASE && frame?.json) consider(frame.json, JSON.stringify(frame.json).length);
+        };
+        const onChunk = ({ text }) => {
+          chunk += text;
+          const obj = firstJsonObject(chunk);
+          if (obj) consider(obj, chunk.length);
+        };
+        session.on("data", onData);
+        session.on("dbChunk", onChunk);
+        const send = () =>
+          session.isConnected &&
+          session.queryDatabase("history_record_info", { accountId: acct, channel: 0, innerCmd: QUERY_LOCAL, query: calendarQuery(day) });
+        send();
+        setTimeout(send, 1500); // the first datagram is occasionally dropped; one resend covers it
+        const timer = setTimeout(() => done(undefined, chunk.length), 14000);
+      });
+
+      const obj = reply.val;
+      if (obj && obj.mIntRet !== undefined && obj.mIntRet !== 0) {
+        dbg(`recordings.list ${sn} ${day} — camera rejected (mIntRet=${obj.mIntRet})`);
+        return [];
       }
-      session.off?.("dbChunk", onChunk);
-      const rows = (parsed?.data ?? [])
+      const tables = obj?.data === "[]" || obj?.data == null ? [] : obj.data;
+      const raw = Array.isArray(tables)
+        ? tables.filter((t) => t?.table_name === "history_record_info").flatMap((t) => t.payload ?? [])
+        : [];
+      const rows = raw
         .map(normalize)
         .filter((r) => r.storage_path)
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
-      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (raw ${chunk.length}B received)`);
+      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (reply ${reply.raw ?? 0}B, mIntRet=${obj?.mIntRet ?? "none"})`);
       return rows;
     });
   }
