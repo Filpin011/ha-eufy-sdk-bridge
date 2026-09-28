@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.26";
+const PROBE_BUILD = "probe.27";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -104,6 +104,87 @@ export function createBoot(ctx) {
    * So each variant is the app's own START_LIVE envelope, taken verbatim from the SDK and altered in
    * one respect, and what is watched for is `video` — frames the SDK has already decoded.
    */
+  /**
+   * Put a live keyframe and a stored one side by side.
+   *
+   * Live is the case where we hold the key: the client gives the camera its own modulus and
+   * `decodeVideoFrame` unwraps what comes back. So a live keyframe shows what the wrapping actually
+   * looks like when it is known to be there — and anything the stored one does differently is the
+   * real difference, rather than a guess about it.
+   *
+   * The suspicion to test: two stored keyframes share exactly 32 bytes. An RSA-wrapped key uses
+   * PKCS#1 v1.5 padding, which is random, so the same key wrapped twice shares nothing. Thirty-two
+   * bytes is two AES blocks of identical plaintext — which is not what a wrapped key looks like.
+   */
+  async function compareFrames(session, saved) {
+    const live = [];
+    const onData = (f) => {
+      if (f?.commandName === "CMD_VIDEO_FRAME" && f.data?.length > 8000) live.push(Buffer.from(f.data));
+    };
+    session.on("data", onData);
+
+    console.log("[cmp] starting live to catch a keyframe…");
+    try {
+      session.startLiveMedia?.(0, lastClip?.accountId ?? "", false);
+    } catch (e) {
+      console.log(`[cmp] startLiveMedia threw: ${e?.message}`);
+    }
+    for (let i = 0; i < 40 && !live.length; i++) await new Promise((r) => setTimeout(r, 500));
+    try {
+      session.stopLiveMedia?.(0);
+    } catch {
+      /* nothing to stop */
+    }
+    session.off?.("data", onData);
+
+    if (!live.length) return console.log("[cmp] no live keyframe arrived");
+    const L = live[0];
+    console.log(`[cmp] live keyframe ${L.length} bytes, header says ${L.readUInt32LE(0)} (+22 = ${L.readUInt32LE(0) + 22})`);
+    console.log(`[cmp] live  header : ${L.subarray(0, 22).toString("hex")}`);
+    console.log(`[cmp] live  22..54 : ${L.subarray(22, 54).toString("hex")}`);
+    console.log(`[cmp] live  151..183: ${L.subarray(151, 183).toString("hex")}`);
+
+    // The stored one, for the same offsets.
+    const HDR = 16;
+    let stored;
+    for (let i = 0; i + HDR <= saved.length; ) {
+      if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+      const len = saved.readUInt32LE(i + 6);
+      if (saved[i + 13] === 1 && !stored) stored = saved.subarray(i + HDR, i + HDR + len);
+      i += HDR + len;
+    }
+    if (stored) {
+      console.log(`[cmp] stored keyframe ${stored.length} bytes, header says ${stored.readUInt32LE(0)}`);
+      console.log(`[cmp] store header : ${stored.subarray(0, 22).toString("hex")}`);
+      console.log(`[cmp] store 22..54 : ${stored.subarray(22, 54).toString("hex")}`);
+      console.log(`[cmp] store 151..183: ${stored.subarray(151, 183).toString("hex")}`);
+    }
+
+    // What the SDK itself makes of each, at every sign code that means anything.
+    const look = (buf, what) => {
+      for (const sc of [0, 1, 8]) {
+        let out;
+        try {
+          out = session.decodeVideoFrame?.(buf, sc);
+        } catch (e) {
+          console.log(`[cmp] decodeVideoFrame(${what}, signCode ${sc}) threw: ${String(e?.message).slice(0, 50)}`);
+          continue;
+        }
+        if (!out) {
+          console.log(`[cmp] decodeVideoFrame(${what}, signCode ${sc}) -> nothing`);
+          continue;
+        }
+        const ok = out[0] === 0 && out[1] === 0 && out[2] === 0 && out[3] === 1;
+        console.log(
+          `[cmp] decodeVideoFrame(${what}, signCode ${sc}) -> ${out.length} bytes ${out.subarray(0, 10).toString("hex")}` +
+            `${ok ? "  *** START CODE, nal " + (out[4] & 0x1f) + " ***" : ""}`,
+        );
+      }
+    };
+    look(L, "live");
+    if (stored) look(stored, "stored");
+  }
+
   async function askForStream(session, clipPath, accountId) {
     const heard = { video: 0, media: 0, data: 0, bytes: 0 };
     const onVideo = (v) => {
@@ -624,7 +705,14 @@ export function createBoot(ctx) {
       await new Promise((r) => setTimeout(r, 9000));
     }
     // The file is in hand (or not); either way, ask the camera to play it instead.
-    await askForStream(session, clip, accountId);
+    // The variants that carried a file were ignored outright; what the camera does answer is a
+    // plain live start. So compare the two keyframes instead of guessing at a third envelope.
+    try {
+      const savedBytes = await fsp.readFile(SAVED);
+      await compareFrames(session, savedBytes);
+    } catch (e) {
+      console.log(`[cmp] no saved clip to compare against: ${e?.message}`);
+    }
 
     session.off?.("data", onData);
     session.off?.("image", onImage);
