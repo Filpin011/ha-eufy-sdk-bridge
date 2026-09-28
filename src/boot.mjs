@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.30";
+const PROBE_BUILD = "probe.31";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -117,6 +117,104 @@ export function createBoot(ctx) {
    * PKCS#1 v1.5 padding, which is random, so the same key wrapped twice shares nothing. Thirty-two
    * bytes is two AES blocks of identical plaintext — which is not what a wrapped key looks like.
    */
+  /**
+   * Send the download command on the channel eufy reserves for downloads.
+   *
+   * A sibling project reading the NVR's WebRTC transport lists eufy's logical links as
+   * `{COMMAND: 0, MEDIA: 1, NOTIFY: 2, DOWNLOAD: 3, PLAYBACK: 4, LIVE: 5}`. The P2P transport carries
+   * the same idea in the second byte of every frame's data-type header:
+   * `{DATA: 0, VIDEO: 1, CONTROL: 2, BINARY: 3}` — and 3 is DOWNLOAD in both.
+   *
+   * Everything sent so far went out as DATA, because that is what every SDK send defaults to. A
+   * well-formed command on the wrong channel is exactly what answers -1 rather than -104, which is
+   * what 1024, 1025 and 1042 have each been answering.
+   *
+   * The codec is not exported, so these four pieces are rebuilt from its source: the magic word, the
+   * data-type header, the command header, and the string payload. `send` and the session's own
+   * sequence number and level-1 key are reachable at runtime.
+   */
+  const P2P_MAGIC = "XZYH";
+  const DTYPE = { DATA: Buffer.from([0xd1, 0x00]), VIDEO: Buffer.from([0xd1, 0x01]), CONTROL: Buffer.from([0xd1, 0x02]), BINARY: Buffer.from([0xd1, 0x03]) };
+  const MSG_DATA = Buffer.from([0xf1, 0xd0]);
+
+  function cmdHeader(seq, commandType, dtype) {
+    const s = Buffer.allocUnsafe(2);
+    s.writeUInt16BE(seq & 0xffff, 0);
+    const c = Buffer.allocUnsafe(2);
+    c.writeUInt16LE(commandType, 0);
+    return Buffer.concat([dtype, s, Buffer.from(P2P_MAGIC), c]);
+  }
+
+  function stringPayload(value, channel, key) {
+    const raw = Buffer.from(value, "utf-8");
+    let data = raw;
+    if (key?.length === 16) {
+      const size = raw.length < 16 ? 16 : Math.ceil(raw.length / 16) * 16;
+      const padded = Buffer.alloc(size);
+      raw.copy(padded);
+      const c = crypto.createCipheriv("aes-128-ecb", key, null);
+      c.setAutoPadding(false);
+      data = Buffer.concat([c.update(padded), c.final()]);
+    }
+    const head = Buffer.allocUnsafe(2);
+    head.writeUInt16LE(data.length, 0);
+    return Buffer.concat([
+      head,
+      Buffer.from([0x00, 0x00]),
+      Buffer.from([0x01, 0x00]),
+      Buffer.from([channel, key?.length === 16 ? 0x01 : 0x00]),
+      Buffer.from([0x00, 0x00]),
+      data,
+    ]);
+  }
+
+  async function tryBinaryChannel(session, clipPath, accountId) {
+    if (!session.connectAddress) return console.log("[bin] session has no address");
+    const seen = { data: 0, binary: 0, bytes: 0 };
+    const onData = (f) => {
+      seen.data++;
+      if (f?.dataType === 3) {
+        seen.binary++;
+        seen.bytes += f?.data?.length ?? 0;
+        if (seen.binary <= 6) console.log(`[bin] BINARY frame ${f.commandName} ${f.data?.length ?? 0} bytes ${f.data?.subarray(0, 16).toString("hex")}`);
+      } else if (f?.json && seen.data <= 25) {
+        console.log(`[bin] ${f.commandName} (type ${f.dataType}) json=${JSON.stringify(f.json).slice(0, 160)}`);
+      } else if (seen.data <= 25) {
+        console.log(`[bin] ${f.commandName} (type ${f.dataType}) ${f.data?.length ?? 0} bytes ${f.data?.subarray(0, 8).toString("hex")}`);
+      }
+    };
+    session.on("data", onData);
+
+    const day = clipPath.split("/").at(-2) ?? "";
+    const value = (cmd, payload) =>
+      JSON.stringify({ account_id: accountId ?? "", cmd, mChannel: 0, payload, transaction: clipPath });
+
+    for (const [label, cmd, payload, dtype] of [
+      ["1024 on BINARY", 1024, [{ file: clipPath }], DTYPE.BINARY],
+      ["1042 on BINARY", 1042, [{ date: day }], DTYPE.BINARY],
+      ["1024 on CONTROL", 1024, [{ file: clipPath }], DTYPE.CONTROL],
+      ["1024 on VIDEO", 1024, [{ file: clipPath }], DTYPE.VIDEO],
+    ]) {
+      const before = { ...seen };
+      console.log(`[bin] ── ${label}`);
+      try {
+        const body = Buffer.concat([
+          cmdHeader(session.seqNumber ?? 0, 1350, dtype),
+          stringPayload(value(cmd, payload), 0, session.level1Key),
+        ]);
+        session.seqNumber = ((session.seqNumber ?? 0) + 1) & 0xffff;
+        session.send(session.connectAddress, MSG_DATA, body);
+      } catch (e) {
+        console.log(`[bin]    threw: ${e?.message}`);
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 12000));
+      console.log(`[bin]    +${seen.data - before.data} frames, +${seen.binary - before.binary} on BINARY (${seen.bytes - before.bytes} bytes)`);
+    }
+    session.off?.("data", onData);
+    console.log(`[bin] totals: ${JSON.stringify(seen)}`);
+  }
+
   async function compareFrames(session, saved, accountId) {
     const live = [];
     const onData = (f) => {
@@ -746,6 +844,7 @@ export function createBoot(ctx) {
     try {
       const savedBytes = await fsp.readFile(SAVED);
       await compareFrames(session, savedBytes, accountId);
+      await tryBinaryChannel(session, clip, accountId);
     } catch (e) {
       console.log(`[cmp] no saved clip to compare against: ${e?.message}`);
     }
