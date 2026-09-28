@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.25";
+const PROBE_BUILD = "probe.26";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -93,6 +93,86 @@ export function createBoot(ctx) {
    * a channel, an ARRAY payload and a correlation string. The attempts sent `{cmd, payload: {…}}`.
    * That was a malformed envelope, not a refusal.
    */
+  /**
+   * Ask the camera to SEND the recording, rather than to hand over its file.
+   *
+   * For live the client puts its own RSA modulus in `encryptkey`, and the camera wraps each
+   * keyframe's AES key with it — `decodeVideoFrame` then unwraps it with the matching private half.
+   * The camera is already willing to encrypt for a key we own. If a recording can be made to travel
+   * that same path, the cloud's mangled PEM stops mattering: the key would be ours.
+   *
+   * So each variant is the app's own START_LIVE envelope, taken verbatim from the SDK and altered in
+   * one respect, and what is watched for is `video` — frames the SDK has already decoded.
+   */
+  async function askForStream(session, clipPath, accountId) {
+    const heard = { video: 0, media: 0, data: 0, bytes: 0 };
+    const onVideo = (v) => {
+      heard.video++;
+      const len = v?.data?.length ?? v?.length ?? 0;
+      heard.bytes += len;
+      if (heard.video <= 3) console.log(`[ask] VIDEO ${len} bytes`);
+    };
+    const onMedia = (m) => {
+      heard.media++;
+      if (heard.media <= 3) console.log(`[ask] MEDIA ${String(JSON.stringify(m)).slice(0, 140)}`);
+    };
+    const onData = (f) => {
+      heard.data++;
+      if (f?.json && heard.data <= 30) console.log(`[ask] ${f.commandName} json=${JSON.stringify(f.json).slice(0, 200)}`);
+    };
+    session.on("video", onVideo);
+    session.on("media", onMedia);
+    session.on("data", onData);
+
+    // The app's own start, straight from the SDK — modulus, streamtype, video_type and all.
+    let base;
+    try {
+      base = JSON.parse(String(session.startLiveJson(0, accountId ?? "")));
+      console.log(`[ask] live envelope fields: ${Object.keys(base.data ?? {}).join(",")}`);
+      console.log(`[ask] encryptkey present: ${Boolean(base.data?.encryptkey)}`);
+    } catch (e) {
+      return console.log(`[ask] could not read the live envelope: ${e?.message}`);
+    }
+
+    const stamp = (clipPath.split("/").pop() ?? "").replace(".zxvideo", "");
+    const variants = [
+      ["A live, unchanged (CONTROL)", { ...base }],
+      ["B entrytype 1 + file", { commandType: base.commandType, data: { ...base.data, entrytype: 1, file: clipPath, filepath: clipPath } }],
+      ["C streamtype 1 + file", { commandType: base.commandType, data: { ...base.data, streamtype: 1, file: clipPath, filepath: clipPath } }],
+      ["D cmd 1024 + live block", { commandType: 1024, data: { ...base.data, cmd: 1024, extValue: 1024, file: clipPath, filepath: clipPath, start_time: stamp } }],
+      ["E cmd 1025 + live block", { commandType: 1025, data: { ...base.data, cmd: 1025, extValue: 1025, file: clipPath, filepath: clipPath, start_time: stamp } }],
+    ];
+
+    for (const [label, obj] of variants) {
+      const before = { ...heard };
+      console.log(`[ask] ── ${label}`);
+      try {
+        session.sendSetPayload(obj.data?.cmd ?? 1000, {}, { rawValue: obj, wrapCmd: 1700, channel: 0, accountId });
+      } catch (e) {
+        console.log(`[ask]    threw: ${e?.message}`);
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 15000));
+      const dv = heard.video - before.video;
+      console.log(
+        `[ask]    +${dv} video (${heard.bytes - before.bytes} bytes), +${heard.media - before.media} media, ` +
+          `+${heard.data - before.data} control${dv > 0 ? "   <<< FRAMES" : ""}`,
+      );
+      // Leave the channel as we found it, so the next variant starts clean.
+      try {
+        session.stopLiveMedia?.(0);
+      } catch {
+        /* nothing started */
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    session.off?.("video", onVideo);
+    session.off?.("media", onMedia);
+    session.off?.("data", onData);
+    console.log(`[ask] totals: ${JSON.stringify(heard)}`);
+  }
+
   async function tryPlayback(session, clipPath, accountId) {
     const heard = { data: 0, video: 0, media: 0, audio: 0 };
     const onData = (f) => {
@@ -544,7 +624,7 @@ export function createBoot(ctx) {
       await new Promise((r) => setTimeout(r, 9000));
     }
     // The file is in hand (or not); either way, ask the camera to play it instead.
-    await tryPlayback(session, clip, accountId);
+    await askForStream(session, clip, accountId);
 
     session.off?.("data", onData);
     session.off?.("image", onImage);
