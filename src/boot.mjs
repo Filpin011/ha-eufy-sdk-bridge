@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
 
-const PROBE_BUILD = "probe.34";
+const PROBE_BUILD = "probe.35";
 
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
@@ -75,6 +75,7 @@ export function createBoot(ctx) {
       await analyse(saved);
       await inspectCipher();
       await tryOlderCipherApi(lastClip?.accountId, lastClip?.stationSn);
+      await legacyCipher(lastClip?.stationSn);
       await tryUnwrap(saved);
       await tryEcies(saved);
       void kickoff("playback attempt");
@@ -766,6 +767,111 @@ export function createBoot(ctx) {
    *
    * `securityAppPost` takes any path, so this costs one request each. Shapes only.
    */
+  /**
+   * Fetch the cipher through the legacy transport, with the client that is known to use it.
+   *
+   * Everything else is in place: the download command works, the container is understood, and
+   * decodeVideoFrame opens a keyframe when the key is right — proved on live, where the key is ours.
+   * The one missing piece is the account's RSA private key, which this SDK's gateway returns with
+   * every letter lowercased, from v1 and v3 alike, while v2 rejects its credentials.
+   *
+   * eufy-security-client reads that key from `v2/app/cipher/get_ciphers` over its own ECDH transport
+   * and decrypts downloads with it. So this asks it directly. One login, one request, and the answer
+   * is either a usable key or a definitive no.
+   *
+   * It logs in ONCE and never retries: a second attempt on a rate-limited account is how the
+   * "hit max login limit" wall gets hit, and one refusal already answers the question.
+   */
+  async function legacyCipher(stationSn) {
+    let mod;
+    try {
+      mod = await import("eufy-security-client");
+    } catch (e) {
+      return console.log(`[legacy] library not installed: ${e?.message}`);
+    }
+    const { HTTPApi } = mod;
+    if (!HTTPApi) return console.log("[legacy] HTTPApi not exported");
+
+    const email = process.env.EUFY_EMAIL;
+    const password = process.env.EUFY_PASSWORD;
+    const country = process.env.EUFY_COUNTRY || "GB";
+    if (!email || !password) return console.log("[legacy] no credentials in the environment");
+    console.log(`[legacy] logging in once as ${email.replace(/(.).*(@.*)/, "$1***$2")} (${country})`);
+
+    let api;
+    try {
+      api = await HTTPApi.initialize(country, email, password);
+      await api.login();
+    } catch (e) {
+      return console.log(`[legacy] login failed: ${String(e?.message).slice(0, 140)}`);
+    }
+
+    // Whose user id the ciphers belong to — the admin of the station, as the endpoint expects.
+    let userId = "";
+    try {
+      const hubs = api.getHubs?.() ?? {};
+      const hub = Object.values(hubs).find((h) => h?.station_sn === stationSn) ?? Object.values(hubs)[0];
+      userId = hub?.member?.admin_user_id ?? "";
+      console.log(`[legacy] station ${hub?.station_sn ?? "?"} admin ${userId ? "found" : "MISSING"}`);
+    } catch (e) {
+      console.log(`[legacy] could not read the hubs: ${e?.message}`);
+    }
+    if (!userId) {
+      try {
+        const p = await api.getPassportProfile?.();
+        userId = p?.user_id ?? "";
+      } catch {
+        /* best effort */
+      }
+    }
+    if (!userId) return console.log("[legacy] no user id to ask with");
+
+    let cipher;
+    try {
+      cipher = await api.getCipher(95, userId);
+    } catch (e) {
+      return console.log(`[legacy] getCipher failed: ${String(e?.message).slice(0, 140)}`);
+    }
+    if (!cipher || !Object.keys(cipher).length) return console.log("[legacy] empty cipher record");
+
+    for (const [k, v] of Object.entries(cipher)) {
+      if (typeof v !== "string") {
+        console.log(`[legacy]   ${k}: ${typeof v} ${v}`);
+        continue;
+      }
+      console.log(`[legacy]   ${k}: ${v.length} chars, uppercase: ${/[A-Z]/.test(v)}`);
+    }
+
+    const pem = cipher.private_key;
+    if (typeof pem !== "string" || !/[A-Z]/.test(pem)) {
+      return console.log("[legacy] the legacy transport returns it lowercased too — the key is mangled at the source");
+    }
+    console.log("[legacy] *** the key has its case intact — opening the clip ***");
+
+    // Straight to the point: unwrap the saved keyframe and see whether H.264 falls out.
+    try {
+      const saved = await fsp.readFile(SAVED);
+      let body;
+      for (let i = 0; i + 16 <= saved.length; ) {
+        if (!(saved[i] === 0x58 && saved[i + 1] === 0x5a && saved[i + 2] === 0x59 && saved[i + 3] === 0x48)) break;
+        const len = saved.readUInt32LE(i + 6);
+        if (saved[i + 13] === 1 && !body) body = saved.subarray(i + 16, i + 16 + len);
+        i += 16 + len;
+      }
+      if (!body) return console.log("[legacy] no keyframe in the saved clip");
+      const aes = crypto.privateDecrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, body.subarray(22, 150));
+      console.log(`[legacy] unwrapped a ${aes.length}-byte media key`);
+      const d = crypto.createDecipheriv(aes.length >= 32 ? "aes-256-ecb" : "aes-128-ecb", aes.subarray(0, aes.length >= 32 ? 32 : 16), null);
+      d.setAutoPadding(false);
+      const head = Buffer.concat([d.update(body.subarray(151, 279)), d.final()]);
+      const ok = head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 1;
+      console.log(`[legacy] keyframe head: ${head.subarray(0, 16).toString("hex")}`);
+      console.log(ok ? `[legacy] *** START CODE, nal ${head[4] & 0x1f} — THE CLIP IS OPEN ***` : "[legacy] no start code — the key is right but the layout is not");
+    } catch (e) {
+      console.log(`[legacy] unwrap failed: ${String(e?.message).slice(0, 120)}`);
+    }
+  }
+
   async function tryOlderCipherApi(accountId, stationSn) {
     if (!accountId || !stationSn) {
       try {

@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@mega-yfue/eufy-sdk": "0.1.0",
+    "eufy-security-client": "^3.8.0",
     "ws": "^8.18.0"
   }
 }
