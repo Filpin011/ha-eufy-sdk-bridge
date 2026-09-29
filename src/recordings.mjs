@@ -109,6 +109,7 @@ export function createRecordings(ctx) {
   // without turning on debug — this path is new and worth watching.
   const dbg = ctx.eventLog ?? ctx.dbg ?? (() => {});
 
+  let loggedRowShape = false; // one-time diagnostic: what fields a calendar row actually carries
   const stationSession = (sn) => (eufy.getP2pSessions?.() ?? new Map()).get(sn);
   async function accountId() {
     const devs = await eufy.getDevices();
@@ -253,11 +254,19 @@ export function createRecordings(ctx) {
         dbg(`recordings.list ${sn} ${day} — gave up (mIntRet=${obj.mIntRet})`);
         return [];
       }
-      const rows = rowsFromReply(obj)
+      const rawRows = rowsFromReply(obj);
+      const rows = rawRows
         .map(normalize)
         .filter((r) => r.storage_path)
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
       dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (reply ${raw}B, mIntRet=${obj?.mIntRet ?? "none"})`);
+      // One-time visibility into what a row actually carries, so the thumbnail/crop fields the app uses
+      // (thumb_path, crop_path, …) can be wired up instead of guessed.
+      if (rows.length && !loggedRowShape) {
+        loggedRowShape = true;
+        const sample = rawRows[0]?.payload ?? rawRows[0] ?? {};
+        dbg(`recordings.list row keys: [${Object.keys(sample).join(", ")}] · thumb=${rows[0].thumb_path ?? "none"}`);
+      }
       return rows;
     });
   }
@@ -305,6 +314,7 @@ export function createRecordings(ctx) {
       let finished = false;
       let idle;
       const frames = [];
+      let bytes = 0; // running total for progress logging
       const seen = new Map(); // command id → count, so a no-ACK failure can say what the camera DID send
       let firstDl; // first CMD_DOWNLOAD_VIDEO frame we couldn't read as an accept (hex head), for diagnosis
       const finish = (err, value) => {
@@ -347,8 +357,14 @@ export function createRecordings(ctx) {
           // A 1024 frame that isn't our "accept" shape — capture it once. A non-zero int32 head is the
           // camera's rejection code; this makes it visible instead of silently waiting out the timeout.
           if (!firstDl) firstDl = d.subarray(0, 24).toString("hex");
+        } else if (id === CMD_CONVERT_MP4_OK) {
+          // Announces the transfer with the total byte count — first sign the camera accepted and is sending.
+          const total = Buffer.isBuffer(d) && d.length >= 4 ? d.readUInt32LE(0) : undefined;
+          dbg(`recordings.download ${serial} — transfer starting${total ? ` (~${total}B)` : ""}`);
         } else if (id === CMD_VIDEO_FRAME && d?.length > 22) {
           frames.push(Buffer.from(d));
+          bytes += d.length;
+          if (frames.length % 50 === 0) dbg(`recordings.download ${serial} — ${frames.length} frames, ${bytes}B so far`);
           settleSoon();
         } else if (id === CMD_DOWNLOAD_FINISH) {
           finished = true;
@@ -390,18 +406,6 @@ export function createRecordings(ctx) {
       ctx.beginDownloadHold?.(sn);
       try {
         if (held) await sleep(1500); // let the stream's P2P session actually close on the camera
-        // The download needs a FRESH control session: the verified standalone path (and the reference
-        // implementation) run it on a session whose binary sequence starts at zero and carries no
-        // inherited buffers. Our shared control session is kept warm by keepalives/warmup, and the camera
-        // silently drops the start command on it. So close it and let readySession reopen a clean one.
-        try {
-          const key = eufy.p2p?.stationKeyOf?.(sn) ?? sn;
-          await eufy.p2p?.manager?.close?.(key);
-          dbg(`recordings.download ${sn} — closed stale session, reopening fresh`);
-          await sleep(800);
-        } catch (e) {
-          dbg(`recordings.download ${sn} — session close skipped: ${e?.message ?? e}`);
-        }
         const session = await readySession(sn, signal);
         dbg(`recordings.download ${sn} — session ready, resolving account`);
         const acct = await accountId();
