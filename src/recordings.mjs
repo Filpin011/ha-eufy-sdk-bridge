@@ -172,11 +172,22 @@ export function createRecordings(ctx) {
     const m = String(row?.storage_path ?? "").match(/\/(\d{8})\/[^/]*\.zxvideo$/);
     return m ? m[1] : "";
   }
+  let loggedPushShape = false;
   function noteDetectionRecord(evtPayload) {
     const rec = evtPayload?.payload ?? evtPayload;
     const sn = evtPayload?.deviceSn ?? rec?.device_sn ?? rec?.deviceSn;
     const row = normalize(rec);
-    if (!sn || typeof row.storage_path !== "string" || !row.storage_path.endsWith(".zxvideo")) return;
+    if (!sn || typeof row.storage_path !== "string" || !row.storage_path.endsWith(".zxvideo")) {
+      // One-time look at a detection push that carried no usable recording path, so we can see whether the
+      // record is somewhere else in the payload (or simply not pushed on this camera/account).
+      if (!loggedPushShape) {
+        loggedPushShape = true;
+        const top = Object.keys(evtPayload ?? {}).join(", ");
+        const inner = rec && typeof rec === "object" ? Object.keys(rec).join(", ") : typeof rec;
+        dbg(`recordings.feed — push had no storage_path. top keys: [${top}] · payload keys: [${inner}]`);
+      }
+      return;
+    }
     let m = recent.get(sn);
     if (!m) {
       m = new Map();
