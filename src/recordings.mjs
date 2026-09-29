@@ -390,6 +390,18 @@ export function createRecordings(ctx) {
       ctx.beginDownloadHold?.(sn);
       try {
         if (held) await sleep(1500); // let the stream's P2P session actually close on the camera
+        // The download needs a FRESH control session: the verified standalone path (and the reference
+        // implementation) run it on a session whose binary sequence starts at zero and carries no
+        // inherited buffers. Our shared control session is kept warm by keepalives/warmup, and the camera
+        // silently drops the start command on it. So close it and let readySession reopen a clean one.
+        try {
+          const key = eufy.p2p?.stationKeyOf?.(sn) ?? sn;
+          await eufy.p2p?.manager?.close?.(key);
+          dbg(`recordings.download ${sn} — closed stale session, reopening fresh`);
+          await sleep(800);
+        } catch (e) {
+          dbg(`recordings.download ${sn} — session close skipped: ${e?.message ?? e}`);
+        }
         const session = await readySession(sn, signal);
         dbg(`recordings.download ${sn} — session ready, resolving account`);
         const acct = await accountId();
