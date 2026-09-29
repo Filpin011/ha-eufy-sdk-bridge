@@ -280,10 +280,12 @@ export function createRecordings(ctx) {
       // until we get mIntRet:0 (even for an empty day). When we already have push-accumulated records for
       // this day, keep it short (they're the reliable fallback); otherwise give it the full budget.
       const fallback = recentForDay(sn, day);
-      const maxAttempts = fallback.length ? 2 : 6;
+      // The calendar query is now best-effort (push-accumulated records are the reliable source), so keep
+      // it short — a long retry budget only backs up a queue of slow queries on a sleeping camera.
+      const maxAttempts = fallback.length ? 2 : 3;
       let obj;
       let raw = 0;
-      const deadline = Date.now() + (fallback.length ? 12_000 : 40_000);
+      const deadline = Date.now() + (fallback.length ? 10_000 : 18_000);
       for (let attempt = 1; attempt <= maxAttempts && Date.now() < deadline; attempt++) {
         const reply = await attemptQuery();
         obj = reply.val;
