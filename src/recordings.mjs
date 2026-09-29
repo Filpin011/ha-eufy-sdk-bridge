@@ -159,6 +159,47 @@ export function createRecordings(ctx) {
     };
   }
 
+  // ── recent recordings, accumulated from detection pushes ────────────────────────────────────────────
+  // The flaky calendar query (10017) needs the battery camera awake; a detection push does not — it comes
+  // over FCM and already carries the event's record (storage_path, thumb_path, times). So every detection
+  // is remembered here, and a day's listing merges these with whatever the calendar query returns, so
+  // recent clips show even when the camera is asleep for the query.
+  const recent = new Map(); // sn -> Map<record_id|storage_path, normalized row>
+  // A record's day (YYYYMMDD): record_id is a YYYYMMDDhhmmss timestamp; fall back to the path's date folder.
+  function dayOf(row) {
+    const rid = String(row?.record_id ?? "");
+    if (/^\d{8}/.test(rid)) return rid.slice(0, 8);
+    const m = String(row?.storage_path ?? "").match(/\/(\d{8})\/[^/]*\.zxvideo$/);
+    return m ? m[1] : "";
+  }
+  function noteDetectionRecord(evtPayload) {
+    const rec = evtPayload?.payload ?? evtPayload;
+    const sn = evtPayload?.deviceSn ?? rec?.device_sn ?? rec?.deviceSn;
+    const row = normalize(rec);
+    if (!sn || typeof row.storage_path !== "string" || !row.storage_path.endsWith(".zxvideo")) return;
+    let m = recent.get(sn);
+    if (!m) {
+      m = new Map();
+      recent.set(sn, m);
+    }
+    m.set(String(row.record_id ?? row.storage_path), row);
+    while (m.size > 1000) m.delete(m.keys().next().value); // cap memory; oldest-first eviction
+    dbg(`recordings.feed ${sn} + ${row.storage_path} (day ${dayOf(row)}, ${m.size} cached)`);
+  }
+  function recentForDay(sn, day) {
+    const m = recent.get(sn);
+    return m ? [...m.values()].filter((r) => dayOf(r) === day) : [];
+  }
+  // Merge calendar rows with push-accumulated rows, newest first, de-duplicated by record_id/storage_path.
+  function mergeRows(a, b) {
+    const byKey = new Map();
+    for (const r of [...a, ...b]) {
+      if (!r?.storage_path) continue;
+      byKey.set(String(r.record_id ?? r.storage_path), r);
+    }
+    return [...byKey.values()].sort((x, y) => String(y.start_time).localeCompare(String(x.start_time)));
+  }
+
   // Pull the recording rows out of a 10017 reply, whichever shape the firmware used: the rows may be the
   // payload of the history_record_info table (data:[{table_name, payload:[…]}]) or sit straight in data:[…].
   function rowsFromReply(obj) {
@@ -236,11 +277,14 @@ export function createRecordings(ctx) {
 
       // A freshly-(re)connected or busy camera rejects the query with a negative mIntRet (seen: -1100)
       // or just drops it; the very next attempt usually succeeds. So retry — like the eufy app does —
-      // until we get mIntRet:0 (even for an empty day), bounded well under the HA-side 45s ceiling.
+      // until we get mIntRet:0 (even for an empty day). When we already have push-accumulated records for
+      // this day, keep it short (they're the reliable fallback); otherwise give it the full budget.
+      const fallback = recentForDay(sn, day);
+      const maxAttempts = fallback.length ? 2 : 6;
       let obj;
       let raw = 0;
-      const deadline = Date.now() + 40_000;
-      for (let attempt = 1; attempt <= 6 && Date.now() < deadline; attempt++) {
+      const deadline = Date.now() + (fallback.length ? 12_000 : 40_000);
+      for (let attempt = 1; attempt <= maxAttempts && Date.now() < deadline; attempt++) {
         const reply = await attemptQuery();
         obj = reply.val;
         raw = reply.raw ?? 0;
@@ -250,19 +294,16 @@ export function createRecordings(ctx) {
         await sleep(900);
       }
 
-      if (obj && obj.mIntRet !== undefined && obj.mIntRet !== 0) {
-        dbg(`recordings.list ${sn} ${day} — gave up (mIntRet=${obj.mIntRet})`);
-        return [];
-      }
-      const rawRows = rowsFromReply(obj);
-      const rows = rawRows
-        .map(normalize)
-        .filter((r) => r.storage_path)
-        .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
-      dbg(`recordings.list ${sn} ${day} → ${rows.length} row(s) (reply ${raw}B, mIntRet=${obj?.mIntRet ?? "none"})`);
-      // One-time visibility into what a row actually carries, so the thumbnail/crop fields the app uses
-      // (thumb_path, crop_path, …) can be wired up instead of guessed.
-      if (rows.length && !loggedRowShape) {
+      const rejected = obj && obj.mIntRet !== undefined && obj.mIntRet !== 0;
+      const rawRows = rejected ? [] : rowsFromReply(obj);
+      const calRows = rawRows.map(normalize).filter((r) => r.storage_path);
+      const rows = mergeRows(calRows, fallback);
+      dbg(
+        `recordings.list ${sn} ${day} → ${rows.length} row(s) ` +
+          `(calendar ${calRows.length}${rejected ? " rejected" : ""}, push ${fallback.length}, reply ${raw}B)`,
+      );
+      // One-time visibility into what a calendar row actually carries.
+      if (calRows.length && !loggedRowShape) {
         loggedRowShape = true;
         const sample = rawRows[0]?.payload ?? rawRows[0] ?? {};
         dbg(`recordings.list row keys: [${Object.keys(sample).join(", ")}] · thumb=${rows[0].thumb_path ?? "none"}`);
@@ -429,5 +470,5 @@ export function createRecordings(ctx) {
     });
   }
 
-  return { listRecordings, fetchThumb, downloadRecording };
+  return { listRecordings, fetchThumb, downloadRecording, noteDetectionRecord };
 }

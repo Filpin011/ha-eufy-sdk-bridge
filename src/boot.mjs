@@ -91,6 +91,10 @@ export function createBoot(ctx) {
           const detection = DETECTION_EVENTS.has(e);
           if (detection) {
             ctx.noteDetection(payload?.deviceSn);
+            // The push already carries the event's recording record (storage_path, thumb_path, times) —
+            // remember it so the recordings card has a reliable list even when the P2P calendar query
+            // can't reach a sleeping battery camera.
+            ctx.noteDetectionRecord?.(payload);
             // Local-storage accounts get no push thumbnail, so pull the fresh event cover from HomeBase
             // storage and (if it changed) nudge HA to re-fetch — otherwise "Last event" stays frozen.
             ctx.onDetectionRefresh?.(payload?.deviceSn);
