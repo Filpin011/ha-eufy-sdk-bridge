@@ -12,6 +12,8 @@
 // existing SDK exports. The heavy download runs only when a clip is actually opened.
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import * as sdk from "@mega-yfue/eufy-sdk";
 import { firstJsonObject } from "./faces.mjs";
 
@@ -104,6 +106,7 @@ function muxToMp4(annexb) {
 
 export function createRecordings(ctx) {
   const { eufy } = ctx;
+  const thumbDir = ctx.eventImageDir ? path.join(ctx.eventImageDir, "rec-thumbs") : null;
   const withDbLock = (fn) => (ctx.withDbLock ? ctx.withDbLock(fn) : fn());
   // Log at the visible "[bridge:event]" level (on by default) so a browse/play attempt can be traced
   // without turning on debug — this path is new and worth watching.
@@ -327,10 +330,30 @@ export function createRecordings(ctx) {
 
   // ── thumbnail ────────────────────────────────────────────────────────────────────────────────────
   /** The event snapshot JPEG for a recording (its thumb_path), or undefined. */
+  function thumbCacheFile(sn, thumbPath) {
+    if (!thumbDir) return null;
+    const hash = crypto.createHash("sha1").update(thumbPath).digest("hex").slice(0, 24);
+    return path.join(thumbDir, `${sn}-${hash}.jpg`);
+  }
   async function fetchThumb(sn, thumbPath) {
     if (typeof thumbPath !== "string" || !thumbPath.startsWith("/")) throw new Error("bad thumb path");
+    // Served from disk once fetched — a snapshot never changes, so this survives camera sleep and makes
+    // a revisit instant.
+    const cacheFile = thumbCacheFile(sn, thumbPath);
+    if (cacheFile) {
+      try {
+        const cached = await fs.readFile(cacheFile);
+        if (cached?.length) return cached;
+      } catch {
+        /* not cached yet */
+      }
+    }
     return withDbLock(async () => {
-      const session = await readySession(sn);
+      // Best-effort: only fetch when the camera is ALREADY connected. Never wake a battery camera just for a
+      // thumbnail — a grid of them would queue 15s connect attempts each and time out (502/504). It gets
+      // cached the first time the camera is up for something else (a live view, a detection).
+      const session = stationSession(sn);
+      if (!session?.isConnected) return undefined;
       const acct = await accountId();
       const images = new Map();
       const onImage = ({ file, data }) => {
@@ -338,9 +361,18 @@ export function createRecordings(ctx) {
       };
       session.on("image", onImage);
       session.requestImage(thumbPath, { accountId: acct });
-      for (let i = 0; i < 40 && !images.has(thumbPath); i++) await sleep(200);
+      for (let i = 0; i < 25 && !images.has(thumbPath); i++) await sleep(200);
       session.off?.("image", onImage);
-      return images.get(thumbPath);
+      const img = images.get(thumbPath);
+      if (img?.length && cacheFile) {
+        try {
+          await fs.mkdir(thumbDir, { recursive: true });
+          await fs.writeFile(cacheFile, img);
+        } catch {
+          /* cache write is best-effort */
+        }
+      }
+      return img;
     });
   }
 
